@@ -29,7 +29,8 @@ use prost::{
 
 use self::fields::DynamicMessageFieldSet;
 use crate::{
-    descriptor::Kind, ExtensionDescriptor, FieldDescriptor, MessageDescriptor, ReflectMessage,
+    descriptor::{Kind, KindIndex},
+    ExtensionDescriptor, FieldDescriptor, MessageDescriptor, ReflectMessage,
 };
 
 /// [`DynamicMessage`] provides encoding, decoding and reflection of a protobuf message.
@@ -592,6 +593,56 @@ impl ReflectMessage for DynamicMessage {
         Self: Sized,
     {
         self.clone()
+    }
+}
+
+/// C1: canonical no-presence default exclusion, shared by the encode
+/// guard and the set-field iterator. Mirrors `default_value()` ordering:
+/// container default (empty list/map) first, then any declared default,
+/// then the kind zero - so the two encode-side surfaces can never drift
+/// and hand-built pools with declared defaults on presence-less fields
+/// keep the pre-C1 equality semantics.
+pub(super) fn is_default_for_field_parts(
+    value: &Value,
+    is_list: bool,
+    is_map: bool,
+    kind: KindIndex,
+    declared_default: Option<&Value>,
+) -> bool {
+    if is_list {
+        return matches!(value, Value::List(list) if list.is_empty());
+    }
+    if is_map {
+        return matches!(value, Value::Map(map) if map.is_empty());
+    }
+    if let Some(default) = declared_default {
+        return value == default;
+    }
+    match (value, kind) {
+        (Value::Bool(v), KindIndex::Bool) => !*v,
+        (Value::I32(v), KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32) => *v == 0,
+        (Value::I64(v), KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64) => *v == 0,
+        (Value::U32(v), KindIndex::Uint32 | KindIndex::Fixed32) => *v == 0,
+        (Value::U64(v), KindIndex::Uint64 | KindIndex::Fixed64) => *v == 0,
+        (Value::F32(v), KindIndex::Float) => *v == 0.0,
+        (Value::F64(v), KindIndex::Double) => *v == 0.0,
+        (Value::String(v), KindIndex::String) => v.is_empty(),
+        (Value::Bytes(v), KindIndex::Bytes) => v.is_empty(),
+        (Value::EnumNumber(v), KindIndex::Enum(_)) => *v == 0,
+        _ => false,
+    }
+}
+
+/// Map-key zero check (map keys have no declared defaults).
+pub(super) fn is_default_mapkey(key: &MapKey, kind: KindIndex) -> bool {
+    match (key, kind) {
+        (MapKey::Bool(v), KindIndex::Bool) => !*v,
+        (MapKey::I32(v), KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32) => *v == 0,
+        (MapKey::I64(v), KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64) => *v == 0,
+        (MapKey::U32(v), KindIndex::Uint32 | KindIndex::Fixed32) => *v == 0,
+        (MapKey::U64(v), KindIndex::Uint64 | KindIndex::Fixed64) => *v == 0,
+        (MapKey::String(v), KindIndex::String) => v.is_empty(),
+        _ => false,
     }
 }
 

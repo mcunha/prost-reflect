@@ -6,10 +6,12 @@ use std::{
 };
 
 use crate::{
-    ExtensionDescriptor, FieldDescriptor, Kind, MessageDescriptor, OneofDescriptor, Value,
+    descriptor::RawFieldView, ExtensionDescriptor, FieldDescriptor, Kind, MessageDescriptor,
+    OneofDescriptor, Value,
 };
 
 use super::{
+    is_default_for_field_parts,
     unknown::{UnknownField, UnknownFieldSet},
     Either,
 };
@@ -27,7 +29,6 @@ pub(crate) trait FieldDescriptorLike: fmt::Debug {
     fn is_group(&self) -> bool;
     fn is_list(&self) -> bool;
     fn is_map(&self) -> bool;
-    fn is_packed(&self) -> bool;
     fn is_packable(&self) -> bool;
     fn has(&self, value: &Value) -> bool {
         self.supports_presence() || !self.is_default_value(value)
@@ -52,6 +53,9 @@ pub(super) enum ValueOrUnknown {
 
 pub(super) enum ValueAndDescriptor<'a> {
     Field(Cow<'a, Value>, FieldDescriptor),
+    /// C1: handle-free borrowed view from iter_set (encode path); no Arc
+    /// refcount traffic per set field.
+    View(Cow<'a, Value>, RawFieldView<'a>),
     Extension(Cow<'a, Value>, ExtensionDescriptor),
     Unknown(&'a UnknownFieldSet),
 }
@@ -164,9 +168,17 @@ impl DynamicMessageFieldSet {
             .iter()
             .filter_map(move |(&number, value)| match value {
                 ValueOrUnknown::Value(value) => {
-                    if let Some(field) = message.get_field(number) {
-                        if field.has(value) {
-                            Some(ValueAndDescriptor::Field(Cow::Borrowed(value), field))
+                    if let Some(view) = message.field_view(number) {
+                        let present = view.supports_presence()
+                            || !is_default_for_field_parts(
+                                value,
+                                view.is_list,
+                                view.is_map,
+                                view.kind_index(),
+                                view.declared_default(),
+                            );
+                        if present {
+                            Some(ValueAndDescriptor::View(Cow::Borrowed(value), view))
                         } else {
                             None
                         }
@@ -467,10 +479,6 @@ impl FieldDescriptorLike for FieldDescriptor {
         self.is_map()
     }
 
-    fn is_packed(&self) -> bool {
-        self.is_packed()
-    }
-
     fn is_packable(&self) -> bool {
         self.is_packable()
     }
@@ -520,10 +528,6 @@ impl FieldDescriptorLike for ExtensionDescriptor {
 
     fn is_map(&self) -> bool {
         self.is_map()
-    }
-
-    fn is_packed(&self) -> bool {
-        self.is_packed()
     }
 
     fn is_packable(&self) -> bool {

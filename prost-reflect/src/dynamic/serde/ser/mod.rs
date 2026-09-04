@@ -68,6 +68,9 @@ where
                 };
                 (name, value, field_desc.kind())
             }
+            // iter() never yields View (encode path only); kept for
+            // exhaustive matching
+            ValueAndDescriptor::View(_, _) => unreachable!("View is encode-only"),
             ValueAndDescriptor::Extension(value, ref extension_desc) => {
                 (extension_desc.json_name(), value, extension_desc.kind())
             }

@@ -86,7 +86,7 @@ pub enum Kind {
 }
 
 #[derive(Copy, Clone)]
-enum KindIndex {
+pub(crate) enum KindIndex {
     Double,
     Float,
     Int32,
@@ -252,6 +252,15 @@ struct MessageDescriptorInner {
     field_names: HashMap<Box<str>, FieldIndex>,
     field_json_names: HashMap<Box<str>, FieldIndex>,
     oneofs: Vec<OneofDescriptorInner>,
+    /// Whether this is a synthetic map-entry message (cached at pool
+    /// build from the raw DescriptorProto options; immutable after).
+    map_entry: bool,
+}
+
+impl MessageDescriptorInner {
+    fn map_entry_flag(&self) -> bool {
+        self.map_entry
+    }
 }
 
 /// A oneof field in a protobuf message.
@@ -285,6 +294,84 @@ struct FieldDescriptorInner {
     supports_presence: bool,
     cardinality: Cardinality,
     default: Option<Value>,
+}
+
+/// A borrowed, handle-free view of a resolved field (C1): carries the
+/// field's inner data plus enough pool access to resolve map entries,
+/// with no Arc refcount traffic. Built once per set field per pass by
+/// the encode iterators; the encode dispatch never constructs
+/// FieldDescriptor handles.
+#[derive(Clone, Copy)]
+pub(crate) struct RawFieldView<'a> {
+    inner: &'a FieldDescriptorInner,
+    pool: &'a DescriptorPool,
+    pub(crate) is_list: bool,
+    pub(crate) is_map: bool,
+    pub(crate) is_group: bool,
+}
+
+impl<'a> RawFieldView<'a> {
+    fn new(
+        inner: &'a FieldDescriptorInner,
+        pool: &'a DescriptorPool,
+        is_list: bool,
+        is_map: bool,
+        is_group: bool,
+    ) -> Self {
+        RawFieldView {
+            inner,
+            pool,
+            is_list,
+            is_map,
+            is_group,
+        }
+    }
+
+    pub(crate) fn number(&self) -> u32 {
+        self.inner.number
+    }
+
+    pub(crate) fn kind_index(&self) -> KindIndex {
+        self.inner.kind
+    }
+
+    pub(crate) fn is_packed(&self) -> bool {
+        self.inner.is_packed
+    }
+
+    pub(crate) fn supports_presence(&self) -> bool {
+        self.inner.supports_presence
+    }
+
+    /// The declared proto2 default, when the field declares one (C1
+    /// default exclusion needs it even on presence-less hand-built pools).
+    pub(crate) fn declared_default(&self) -> Option<&'a Value> {
+        self.inner.default.as_ref()
+    }
+
+    /// The map entry message's key and value fields as borrowed views,
+    /// resolved once per map field (not per map entry).
+    pub(crate) fn map_entry_fields(&self) -> Option<(RawFieldView<'a>, RawFieldView<'a>)> {
+        let index = match self.inner.kind {
+            KindIndex::Message(message) if self.is_map => message,
+            _ => return None,
+        };
+        let entry = &self.pool.inner.messages[index as usize];
+        let key = entry.field_by_number(MAP_ENTRY_KEY_NUMBER)?;
+        let value = entry.field_by_number(MAP_ENTRY_VALUE_NUMBER)?;
+        Some((
+            RawFieldView::new(key, self.pool, false, false, false),
+            RawFieldView::new(value, self.pool, false, false, false),
+        ))
+    }
+}
+
+impl MessageDescriptorInner {
+    pub(crate) fn field_by_number(&self, number: u32) -> Option<&FieldDescriptorInner> {
+        self.field_numbers
+            .get(number)
+            .map(|index| &self.fields[index as usize])
+    }
 }
 
 /// A protobuf extension field definition.

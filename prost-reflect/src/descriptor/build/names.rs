@@ -127,13 +127,15 @@ impl Visitor for NameVisitor<'_> {
         self.pool.messages.push(MessageDescriptorInner {
             id: Identity::new(file, path, full_name, message.name()),
             fields: Vec::with_capacity(message.field.len()),
-            field_numbers: crate::descriptor::FieldNumberIndex::with_capacity(
-                message.field.len(),
-            ),
+            field_numbers: crate::descriptor::FieldNumberIndex::with_capacity(message.field.len()),
             field_names: HashMap::with_capacity(message.field.len()),
             field_json_names: HashMap::with_capacity(message.field.len()),
             oneofs: Vec::with_capacity(message.oneof_decl.len()),
             extensions: Vec::new(),
+            map_entry: message
+                .options
+                .as_ref()
+                .is_some_and(|options| options.value.map_entry()),
             parent,
         });
 
