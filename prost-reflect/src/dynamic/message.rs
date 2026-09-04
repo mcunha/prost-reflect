@@ -12,7 +12,10 @@ use crate::{
     DynamicMessage, MapKey, Value,
 };
 
-use super::{fields::ValueAndDescriptor, unknown::UnknownField};
+use super::{
+    fields::{FieldDescriptorLike, ValueOrUnknown},
+    unknown::UnknownField,
+};
 
 /// The handle-free description surface the wire codecs need (C1):
 /// used by the encode dispatch AND the decode/merge dispatch, so
@@ -176,21 +179,142 @@ fn rawfield_absent_value(view: &RawFieldView<'_>) -> Value {
     }
 }
 
+/// One resolved set-field entry of the encode plan, in slot (ascending
+/// number) order - the sequence the old `iter_set` yielded, so wire
+/// order is unchanged. `Field` entries carry the resolved field index;
+/// no-presence fields at their default were dropped at plan build, so
+/// neither pass re-runs the presence predicate.
+#[derive(Clone, Copy)]
+enum EncodePlanEntry {
+    Field {
+        slot: u32,
+        index: u32,
+    },
+    /// Value with no message field of that number (extension) or unknown
+    /// bytes; resolved per pass exactly as `iter_set` did.
+    Other {
+        slot: u32,
+        number: u32,
+    },
+}
+
+/// Stack-inline plan buffer: <=16 set fields (every corpus shape, typical
+/// proxy messages) never allocate; larger messages spill to the heap.
+/// The plan is per-call, so DynamicMessage stays 40 bytes with no
+/// cache-invalidation machinery.
+struct EncodePlan {
+    len: usize,
+    inline: [EncodePlanEntry; 16],
+    heap: Vec<EncodePlanEntry>,
+}
+
+impl EncodePlan {
+    const EMPTY: EncodePlanEntry = EncodePlanEntry::Field { slot: 0, index: 0 };
+
+    fn new() -> Self {
+        EncodePlan {
+            len: 0,
+            inline: [Self::EMPTY; 16],
+            heap: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, entry: EncodePlanEntry) {
+        if self.len < self.inline.len() {
+            self.inline[self.len] = entry;
+        } else {
+            self.heap.push(entry);
+        }
+        self.len += 1;
+    }
+
+    fn get(&self, i: usize) -> &EncodePlanEntry {
+        if i < self.inline.len() {
+            &self.inline[i]
+        } else {
+            &self.heap[i - self.inline.len()]
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &EncodePlanEntry> {
+        (0..self.len).map(move |i| self.get(i))
+    }
+}
+
+impl DynamicMessage {
+    /// Plan-pass encode: classify every set field once (field index +
+    /// presence), then both the length sum and the write reuse the plan -
+    /// prost's `encode_to_vec` previously re-resolved every field in each
+    /// of its two passes.
+    fn build_encode_plan(&self) -> EncodePlan {
+        let mut plan = EncodePlan::new();
+        for (slot, (number, value)) in self.fields.slots().enumerate() {
+            match value {
+                ValueOrUnknown::Taken => {}
+                ValueOrUnknown::Unknown(_) => plan.push(EncodePlanEntry::Other {
+                    slot: slot as u32,
+                    number,
+                }),
+                ValueOrUnknown::Value(value) => {
+                    if let Some(index) = self.desc.field_index_by_number(number) {
+                        let view = self.desc.view_for_index(index);
+                        // Same presence filter iter_set applied: a
+                        // no-presence field at its default is not encoded.
+                        let present = view.supports_presence()
+                            || !super::is_default_for_field_parts(
+                                value,
+                                view.is_list,
+                                view.is_map,
+                                view.kind_index(),
+                                view.declared_default(),
+                            );
+                        if present {
+                            plan.push(EncodePlanEntry::Field {
+                                slot: slot as u32,
+                                index,
+                            });
+                        }
+                    } else {
+                        plan.push(EncodePlanEntry::Other {
+                            slot: slot as u32,
+                            number,
+                        });
+                    }
+                }
+            }
+        }
+        plan
+    }
+}
+
 impl Message for DynamicMessage {
     fn encode_raw(&self, buf: &mut impl BufMut)
     where
         Self: Sized,
     {
-        for field in self.fields.iter_set(&self.desc) {
-            match field {
-                // iter() (serde/text-format) never feeds encode_raw;
-                // iter_set yields View for set fields
-                ValueAndDescriptor::Field(..) => unreachable!("Field is encode-only via iter_set"),
-                ValueAndDescriptor::View(value, view) => value.encode_field(&view, buf),
-                ValueAndDescriptor::Extension(value, extension_desc) => {
-                    value.encode_field(&extension_desc, buf)
+        let plan = self.build_encode_plan();
+        for entry in plan.iter() {
+            match entry {
+                EncodePlanEntry::Field { slot, index } => {
+                    let view = self.desc.view_for_index(*index);
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => value.encode_field(&view, buf),
+                        ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => unreachable!(),
+                    }
                 }
-                ValueAndDescriptor::Unknown(unknowns) => unknowns.encode_raw(buf),
+                EncodePlanEntry::Other { slot, number } => {
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => match self.desc.get_extension(*number) {
+                            Some(extension_desc) if extension_desc.has(value) => {
+                                value.encode_field(&extension_desc, buf)
+                            }
+                            Some(_) => {}
+                            None => panic!("no field found with number {number}"),
+                        },
+                        ValueOrUnknown::Unknown(unknowns) => unknowns.encode_raw(buf),
+                        ValueOrUnknown::Taken => {}
+                    }
+                }
             }
         }
     }
@@ -233,22 +357,93 @@ impl Message for DynamicMessage {
     }
 
     fn encoded_len(&self) -> usize {
+        let plan = self.build_encode_plan();
         let mut len = 0;
-        for field in self.fields.iter_set(&self.desc) {
-            match field {
-                // iter() (serde/text-format) never feeds encoded_len;
-                // iter_set yields View for set fields
-                ValueAndDescriptor::Field(..) => unreachable!("Field is encode-only via iter_set"),
-                ValueAndDescriptor::View(value, view) => {
-                    len += value.encoded_len(&view);
+        for entry in plan.iter() {
+            match entry {
+                EncodePlanEntry::Field { slot, index } => {
+                    let view = self.desc.view_for_index(*index);
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => len += value.encoded_len(&view),
+                        ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => unreachable!(),
+                    }
                 }
-                ValueAndDescriptor::Extension(value, extension_desc) => {
-                    len += value.encoded_len(&extension_desc);
+                EncodePlanEntry::Other { slot, number } => {
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => match self.desc.get_extension(*number) {
+                            Some(extension_desc) if extension_desc.has(value) => {
+                                len += value.encoded_len(&extension_desc);
+                            }
+                            Some(_) => {}
+                            None => panic!("no field found with number {number}"),
+                        },
+                        ValueOrUnknown::Unknown(unknowns) => len += unknowns.encoded_len(),
+                        ValueOrUnknown::Taken => {}
+                    }
                 }
-                ValueAndDescriptor::Unknown(unknowns) => len += unknowns.encoded_len(),
             }
         }
         len
+    }
+
+    /// Override prost's default (encoded_len + encode_raw as separate
+    /// passes): classify once, size exactly, write once.
+    fn encode_to_vec(&self) -> Vec<u8>
+    where
+        Self: Sized,
+    {
+        let plan = self.build_encode_plan();
+        let mut len = 0;
+        for entry in plan.iter() {
+            match entry {
+                EncodePlanEntry::Field { slot, index } => {
+                    let view = self.desc.view_for_index(*index);
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => len += value.encoded_len(&view),
+                        ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => unreachable!(),
+                    }
+                }
+                EncodePlanEntry::Other { slot, number } => {
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => match self.desc.get_extension(*number) {
+                            Some(extension_desc) if extension_desc.has(value) => {
+                                len += value.encoded_len(&extension_desc);
+                            }
+                            Some(_) => {}
+                            None => panic!("no field found with number {number}"),
+                        },
+                        ValueOrUnknown::Unknown(unknowns) => len += unknowns.encoded_len(),
+                        ValueOrUnknown::Taken => {}
+                    }
+                }
+            }
+        }
+        let mut buf = Vec::with_capacity(len);
+        for entry in plan.iter() {
+            match entry {
+                EncodePlanEntry::Field { slot, index } => {
+                    let view = self.desc.view_for_index(*index);
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => value.encode_field(&view, &mut buf),
+                        ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => unreachable!(),
+                    }
+                }
+                EncodePlanEntry::Other { slot, number } => {
+                    match self.fields.value_at(*slot as usize) {
+                        ValueOrUnknown::Value(value) => match self.desc.get_extension(*number) {
+                            Some(extension_desc) if extension_desc.has(value) => {
+                                value.encode_field(&extension_desc, &mut buf)
+                            }
+                            Some(_) => {}
+                            None => panic!("no field found with number {number}"),
+                        },
+                        ValueOrUnknown::Unknown(unknowns) => unknowns.encode_raw(&mut buf),
+                        ValueOrUnknown::Taken => {}
+                    }
+                }
+            }
+        }
+        buf
     }
 
     fn clear(&mut self) {

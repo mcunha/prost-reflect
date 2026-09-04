@@ -1,12 +1,10 @@
 use std::{borrow::Cow, fmt, mem::replace};
 
 use crate::{
-    descriptor::RawFieldView, ExtensionDescriptor, FieldDescriptor, Kind, MessageDescriptor,
-    OneofDescriptor, Value,
+    ExtensionDescriptor, FieldDescriptor, Kind, MessageDescriptor, OneofDescriptor, Value,
 };
 
 use super::{
-    is_default_for_field_parts,
     unknown::{UnknownField, UnknownFieldSet},
     Either,
 };
@@ -54,9 +52,6 @@ pub(super) enum ValueOrUnknown {
 
 pub(super) enum ValueAndDescriptor<'a> {
     Field(Cow<'a, Value>, FieldDescriptor),
-    /// C1: handle-free borrowed view from iter_set (encode path); no Arc
-    /// refcount traffic per set field.
-    View(Cow<'a, Value>, RawFieldView<'a>),
     Extension(Cow<'a, Value>, ExtensionDescriptor),
     Unknown(&'a UnknownFieldSet),
 }
@@ -209,58 +204,6 @@ impl DynamicMessageFieldSet {
         None
     }
 
-    /// Iterates only over the fields that are actually **set** on this message,
-    /// in ascending field-number order (the `Vec` sort order, which is a
-    /// valid protobuf wire order).
-    ///
-    /// Unlike [`iter`](Self::iter), which walks the entire message descriptor
-    /// and probes `has`/`get` per field to honor `include_default` /
-    /// `index_order` (needed by the serde/text serializers), this walks only
-    /// the sparse `fields` vec. The encode path (`encode_raw` /
-    /// `encoded_len`) needs neither default fields nor source-definition
-    /// order, so this is O(set fields) instead of O(all descriptor fields) ×
-    /// 2 map lookups + a `default_value()` allocation per absent field — a
-    /// large win for messages with many optional fields but few set.
-    pub(crate) fn iter_set<'a>(
-        &'a self,
-        message: &'a MessageDescriptor,
-    ) -> impl Iterator<Item = ValueAndDescriptor<'a>> + 'a {
-        self.fields
-            .iter()
-            .filter_map(move |(number, value)| match value {
-                ValueOrUnknown::Value(value) => {
-                    if let Some(view) = message.field_view(*number) {
-                        let present = view.supports_presence()
-                            || !is_default_for_field_parts(
-                                value,
-                                view.is_list,
-                                view.is_map,
-                                view.kind_index(),
-                                view.declared_default(),
-                            );
-                        if present {
-                            Some(ValueAndDescriptor::View(Cow::Borrowed(value), view))
-                        } else {
-                            None
-                        }
-                    } else if let Some(extension) = message.get_extension(*number) {
-                        if extension.has(value) {
-                            Some(ValueAndDescriptor::Extension(
-                                Cow::Borrowed(value),
-                                extension,
-                            ))
-                        } else {
-                            None
-                        }
-                    } else {
-                        panic!("no field found with number {number}")
-                    }
-                }
-                ValueOrUnknown::Unknown(unknown) => Some(ValueAndDescriptor::Unknown(unknown)),
-                ValueOrUnknown::Taken => None,
-            })
-    }
-
     /// Iterates over the fields in the message.
     ///
     /// If `include_default` is `true`, fields with their default value will be included.
@@ -310,6 +253,18 @@ impl DynamicMessageFieldSet {
                 });
 
         fields.chain(extensions_unknowns)
+    }
+
+    /// Value at a storage slot (encode plan loops index slots directly;
+    /// slot identity is stable while the field set is not structurally
+    /// mutated).
+    pub(super) fn value_at(&self, slot: usize) -> &ValueOrUnknown {
+        &self.fields[slot].1
+    }
+
+    /// (number, value) for every stored slot, in ascending number order.
+    pub(super) fn slots(&self) -> impl Iterator<Item = (u32, &ValueOrUnknown)> + '_ {
+        self.fields.iter().map(|(number, value)| (*number, value))
     }
 
     pub(crate) fn iter_fields<'a>(

@@ -18,9 +18,9 @@ use prost_reflect::{
 use prost_reflect_tests::proto::ComplexType;
 
 mod samples;
-use samples::{complex_sample, scalars_sample};
 use prost_reflect_tests::proto::Scalars;
 use prost_reflect_tests::test_file_descriptor;
+use samples::{complex_sample, scalars_sample};
 
 const DESCRIPTOR_SET_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin"));

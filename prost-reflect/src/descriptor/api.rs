@@ -962,15 +962,25 @@ impl MessageDescriptor {
     /// C1: resolve a set field to a borrowed view without constructing a
     /// FieldDescriptor handle (no Arc refcount traffic on the encode path).
     pub(crate) fn field_view(&self, number: u32) -> Option<RawFieldView<'_>> {
-        let inner = self.inner().field_by_number(number)?;
+        let index = self.field_index_by_number(number)?;
+        Some(self.view_for_index(index))
+    }
+
+    /// Field index for `number` (C2 index probe; no handle construction).
+    pub(crate) fn field_index_by_number(&self, number: u32) -> Option<u32> {
+        self.inner().field_numbers.get(number)
+    }
+
+    /// Borrowed view for an already-resolved field index (encode plan
+    /// passes resolve once per encode pair, then reuse by index).
+    pub(crate) fn view_for_index(&self, index: u32) -> RawFieldView<'_> {
+        let inner = &self.inner().fields[index as usize];
         let is_map = inner.cardinality == Cardinality::Repeated
             && matches!(inner.kind, KindIndex::Message(m)
                 if self.pool.inner.messages[m as usize].map_entry_flag());
         let is_group = matches!(inner.kind, KindIndex::Group(_));
         let is_list = inner.cardinality == Cardinality::Repeated && !is_map;
-        Some(RawFieldView::new(
-            inner, &self.pool, self.index, is_list, is_map, is_group,
-        ))
+        RawFieldView::new(inner, &self.pool, self.index, is_list, is_map, is_group)
     }
 
     fn raw(&self) -> &types::DescriptorProto {
