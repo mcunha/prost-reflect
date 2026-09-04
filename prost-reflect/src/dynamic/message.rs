@@ -211,9 +211,12 @@ impl Message for DynamicMessage {
                     self.fields.clear_by_number(sibling);
                 }
             }
-            let default = rawfield_absent_value(&view);
+            // Lazy default: the slot usually already holds a Value (e.g.
+            // every element of a repeated field after the first), and the
+            // default must not be built per wire occurrence - for
+            // message-kind fields that is a DynamicMessage::new per call.
             self.fields
-                .decode_entry(number, default)
+                .decode_entry(number, || rawfield_absent_value(&view))
                 .merge_field(&view, wire_type, buf, ctx)
         } else if let Some(extension_desc) = self.desc.get_extension(number) {
             self.get_extension_mut(&extension_desc).merge_field(

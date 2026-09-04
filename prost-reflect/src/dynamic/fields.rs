@@ -99,11 +99,16 @@ impl DynamicMessageFieldSet {
         self.entry_mut(number, || desc.default_value())
     }
 
-    /// Decode: return the mutable slot for `number`, inserting `default`
-    /// when the slot is absent or holds non-value state. Oneof sibling
-    /// clearing is the caller's job via `clear_by_number`.
-    pub(super) fn decode_entry(&mut self, number: u32, default: Value) -> &mut Value {
-        self.entry_mut(number, || default)
+    /// Decode: return the mutable slot for `number`, building the default
+    /// (only when the slot is absent or holds non-value state) and
+    /// inserting it. Oneof sibling clearing is the caller's job via
+    /// `clear_by_number`.
+    pub(super) fn decode_entry(
+        &mut self,
+        number: u32,
+        build_default: impl FnOnce() -> Value,
+    ) -> &mut Value {
+        self.entry_mut(number, build_default)
     }
 
     /// Mutable slot for `number`, inserting a default built by
