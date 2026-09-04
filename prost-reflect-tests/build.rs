@@ -6,6 +6,7 @@ fn main() -> io::Result<()> {
         .type_attribute(".test.Scalars", "#[cfg_attr(test, derive(::proptest_derive::Arbitrary))]")
         .type_attribute(".test.ScalarArrays", "#[cfg_attr(test, derive(::proptest_derive::Arbitrary))]")
         .type_attribute(".test.ComplexType", "#[cfg_attr(test, derive(::proptest_derive::Arbitrary))]")
+        .type_attribute(".test.EnumCarrier", "#[cfg_attr(test, derive(::proptest_derive::Arbitrary))]")
         .type_attribute(".test.WellKnownTypes", "#[cfg_attr(test, derive(::proptest_derive::Arbitrary))]")
         .field_attribute(
             ".test.WellKnownTypes.timestamp",

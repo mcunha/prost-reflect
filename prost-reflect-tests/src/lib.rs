@@ -8,6 +8,8 @@ mod decode;
 #[cfg(test)]
 mod desc;
 #[cfg(test)]
+mod descriptor_api;
+#[cfg(test)]
 mod json;
 #[cfg(test)]
 mod text_format;

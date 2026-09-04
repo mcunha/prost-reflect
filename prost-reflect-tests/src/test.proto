@@ -122,3 +122,8 @@ message IndexOrder {
   int32 b = 2;
   int32 c = 1;
 }
+
+message EnumCarrier {
+  repeated ComplexType.MyEnum repeated_value = 1;
+  ComplexType.MyEnum single_value = 2;
+}

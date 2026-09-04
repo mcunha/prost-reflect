@@ -1165,8 +1165,19 @@ impl fmt::Display for Value {
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn type_sizes() {
+    use crate::descriptor::{DescriptorPool, EnumDescriptor, FieldDescriptor, MessageDescriptor};
     assert_eq!(std::mem::size_of::<DynamicMessage>(), 40);
     assert_eq!(std::mem::size_of::<Value>(), 56);
+    // Hot handles and the pool: tier1 C1/C4 must not grow these silently.
+    // Layout: DescriptorPool is a bare Arc; Message/EnumDescriptor are
+    // (pool Arc, u32 index); FieldDescriptor nests a MessageDescriptor
+    // plus a field index (hence 24, not 16). Note x86_64 padding granularity:
+    // FieldDescriptor carries 20 real bytes, so <=4 bytes of additions do
+    // not trip these pins - they are a coarse bloat guard, not exact.
+    assert_eq!(std::mem::size_of::<FieldDescriptor>(), 24);
+    assert_eq!(std::mem::size_of::<MessageDescriptor>(), 16);
+    assert_eq!(std::mem::size_of::<EnumDescriptor>(), 16);
+    assert_eq!(std::mem::size_of::<DescriptorPool>(), 8);
 }
 
 pub(crate) enum Either<L, R> {
