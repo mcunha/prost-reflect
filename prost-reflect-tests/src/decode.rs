@@ -11,8 +11,8 @@ use prost_types::FileDescriptorSet;
 
 use crate::{
     proto::{
-        contains_group, message_with_oneof, ComplexType, ContainsGroup, MessageWithOneof,
-        ScalarArrays, Scalars, WellKnownTypes,
+        contains_group, message_with_oneof, ComplexType, ContainsGroup, EnumCarrier,
+        MessageWithOneof, ScalarArrays, Scalars, WellKnownTypes,
     },
     test_file_descriptor,
 };
@@ -724,6 +724,60 @@ proptest! {
     fn roundtrip_arb_well_known_types(message: WellKnownTypes) {
         roundtrip(&message)?;
     }
+
+    // Differential encode parity, byte-exact: the dynamic encoder must
+    // produce byte-identical output to prost's static derive for the
+    // same logical message - the contract tier1 C1/C4 must not break.
+    // Restricted to map-free types: map entry order is outside the wire
+    // contract on BOTH sides (prost-build defaults are HashMap-backed;
+    // prost-reflect's Value::Map is a HashMap too, dynamic/mod.rs), so
+    // map-bearing messages are compared semantically below instead.
+    #[test]
+    fn dynamic_encode_matches_static_scalars(message: Scalars) {
+        encode_parity(&message)?;
+    }
+
+    #[test]
+    fn dynamic_encode_matches_static_scalar_arrays(message: ScalarArrays) {
+        encode_parity(&message)?;
+    }
+
+    // Enum wire bytes (incl. the 5-byte truncated varint for the NEG=-4
+    // value) are byte-pinned here: no other fixture carries an enum field
+    // in the byte-exact set, and decode-normalized comparisons cannot see
+    // wire-form-only divergence.
+    #[test]
+    fn dynamic_encode_matches_static_enum_carrier(message: EnumCarrier) {
+        encode_parity(&message)?;
+    }
+
+    // Differential encode parity, semantic: for map-bearing types the
+    // cross-implementation contract is content equality, not byte
+    // equality. Both encodings are decoded back dynamically and compared
+    // as values - HashMap PartialEq is order-insensitive, so this is
+    // deterministic where byte comparison cannot be.
+    #[test]
+    fn dynamic_encode_semantically_matches_static_complex(message: ComplexType) {
+        encode_semantic_parity(&message)?;
+    }
+
+    #[test]
+    fn dynamic_encode_semantically_matches_static_wkt(message: WellKnownTypes) {
+        encode_semantic_parity(&message)?;
+    }
+
+    // Map-bearing messages: the strongest byte pin that exists today.
+    // Value::Map is a HashMap, so entry order is stable only within one
+    // message instance across repeated encodes (no mutation between
+    // them); across instances/processes it is not. Deterministic map
+    // bytes would require sorted storage upstream - out of scope here.
+    #[test]
+    fn map_encode_is_stable_within_instance(message: ComplexType) {
+        let dynamic = message.transcode_to_dynamic();
+        let first = dynamic.encode_to_vec();
+        let second = dynamic.encode_to_vec();
+        prop_assert_eq!(first, second, "encode unstable within one instance");
+    }
 }
 
 #[test]
@@ -907,6 +961,47 @@ fn roundtrip_group() {
         ],
     })
     .unwrap();
+}
+
+fn encode_parity<T>(message: &T) -> Result<(), TestCaseError>
+where
+    T: PartialEq + Debug + ReflectMessage + Default + prost::Message,
+{
+    let expected = message.encode_to_vec();
+    let dynamic = message.transcode_to_dynamic();
+    prop_assert_eq!(
+        dynamic.encode_to_vec(),
+        expected,
+        "dynamic encode diverged from static prost for {:?}",
+        message
+    );
+    Ok(())
+}
+
+/// Map-bearing types: decode both encodings back dynamically and compare
+/// as values (order-insensitive). Map entry order is outside the wire
+/// contract; a divergence here means content differs, which byte order
+/// could never explain. Note the limit of decode-normalized equality: an
+/// encoder divergence the decoder normalizes away (packedness, varint
+/// width, field order, last-wins duplicates) is invisible here - the
+/// byte-exact properties (map-free fixtures, incl. EnumCarrier) are the
+/// wire-form pins.
+fn encode_semantic_parity<T>(message: &T) -> Result<(), TestCaseError>
+where
+    T: PartialEq + Debug + ReflectMessage + Default + prost::Message,
+{
+    let expected = message.encode_to_vec();
+    let dynamic = message.transcode_to_dynamic();
+    let actual = dynamic.encode_to_vec();
+    let desc = dynamic.descriptor().clone();
+    let decode = |bytes: &[u8]| DynamicMessage::decode(desc.clone(), bytes).unwrap();
+    prop_assert_eq!(
+        decode(&actual),
+        decode(&expected),
+        "dynamic and static encodings carry different content for {:?}",
+        message
+    );
+    Ok(())
 }
 
 fn roundtrip<T>(message: &T) -> Result<(), TestCaseError>

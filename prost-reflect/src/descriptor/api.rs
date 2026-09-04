@@ -24,7 +24,7 @@ use crate::{
         types::{self, Options},
         Definition, DefinitionKind, DescriptorIndex, EnumDescriptorInner, EnumValueDescriptorInner,
         ExtensionDescriptorInner, FieldDescriptorInner, FileDescriptorInner, KindIndex,
-        MessageDescriptorInner, MethodDescriptorInner, OneofDescriptorInner,
+        MessageDescriptorInner, MethodDescriptorInner, OneofDescriptorInner, RawFieldView,
         ServiceDescriptorInner, MAP_ENTRY_KEY_NUMBER, MAP_ENTRY_VALUE_NUMBER,
     },
     Cardinality, DescriptorError, DescriptorPool, DynamicMessage, EnumDescriptor,
@@ -770,8 +770,8 @@ impl MessageDescriptor {
     pub fn fields(&self) -> impl ExactSizeIterator<Item = FieldDescriptor> + '_ {
         self.inner()
             .field_numbers
-            .values()
-            .map(|&index| FieldDescriptor {
+            .iter_indices()
+            .map(|index| FieldDescriptor {
                 message: self.clone(),
                 index,
             })
@@ -852,8 +852,8 @@ impl MessageDescriptor {
     pub fn get_field(&self, number: u32) -> Option<FieldDescriptor> {
         self.inner()
             .field_numbers
-            .get(&number)
-            .map(|&index| FieldDescriptor {
+            .get(number)
+            .map(|index| FieldDescriptor {
                 message: self.clone(),
                 index,
             })
@@ -894,11 +894,7 @@ impl MessageDescriptor {
     /// [`map_entry_value_field`][MessageDescriptor::map_entry_value_field] for more a convenient way
     /// to get these fields.
     pub fn is_map_entry(&self) -> bool {
-        self.raw()
-            .options
-            .as_ref()
-            .map(|o| o.value.map_entry())
-            .unwrap_or(false)
+        self.inner().map_entry_flag()
     }
 
     /// If this is a [map entry](MessageDescriptor::is_map_entry), returns a [`FieldDescriptor`] for the key.
@@ -961,6 +957,30 @@ impl MessageDescriptor {
 
     fn inner(&self) -> &MessageDescriptorInner {
         &self.pool.inner.messages[self.index as usize]
+    }
+
+    /// C1: resolve a set field to a borrowed view without constructing a
+    /// FieldDescriptor handle (no Arc refcount traffic on the encode path).
+    pub(crate) fn field_view(&self, number: u32) -> Option<RawFieldView<'_>> {
+        let index = self.field_index_by_number(number)?;
+        Some(self.view_for_index(index))
+    }
+
+    /// Field index for `number` (C2 index probe; no handle construction).
+    pub(crate) fn field_index_by_number(&self, number: u32) -> Option<u32> {
+        self.inner().field_numbers.get(number)
+    }
+
+    /// Borrowed view for an already-resolved field index (encode plan
+    /// passes resolve once per encode pair, then reuse by index).
+    pub(crate) fn view_for_index(&self, index: u32) -> RawFieldView<'_> {
+        let inner = &self.inner().fields[index as usize];
+        let is_map = inner.cardinality == Cardinality::Repeated
+            && matches!(inner.kind, KindIndex::Message(m)
+                if self.pool.inner.messages[m as usize].map_entry_flag());
+        let is_group = matches!(inner.kind, KindIndex::Group(_));
+        let is_list = inner.cardinality == Cardinality::Repeated && !is_map;
+        RawFieldView::new(inner, &self.pool, self.index, is_list, is_map, is_group)
     }
 
     fn raw(&self) -> &types::DescriptorProto {
@@ -1128,10 +1148,6 @@ impl FieldDescriptor {
         } else {
             self.kind().default_value()
         }
-    }
-
-    pub(crate) fn is_packable(&self) -> bool {
-        self.inner().kind.is_packable()
     }
 
     fn inner(&self) -> &FieldDescriptorInner {
@@ -1304,6 +1320,34 @@ impl ExtensionDescriptor {
         Kind::new(&self.pool, self.inner().kind)
     }
 
+    /// C1: handle-free kind index for the encode dispatch.
+    pub(crate) fn kind_index_inner(&self) -> KindIndex {
+        self.inner().kind
+    }
+
+    /// C1: map entry key/value views for a map-shaped extension, resolved
+    /// once per field (mirrors MessageDescriptor::field_view).
+    pub(crate) fn map_entry_views(&self) -> Option<(RawFieldView<'_>, RawFieldView<'_>)> {
+        let inner = self.inner();
+        if inner.cardinality != Cardinality::Repeated {
+            return None;
+        }
+        let message = match inner.kind {
+            KindIndex::Message(message) => message,
+            _ => return None,
+        };
+        if !self.pool.inner.messages[message as usize].map_entry_flag() {
+            return None;
+        }
+        let entry = &self.pool.inner.messages[message as usize];
+        let key = entry.field_by_number(MAP_ENTRY_KEY_NUMBER)?;
+        let value = entry.field_by_number(MAP_ENTRY_VALUE_NUMBER)?;
+        Some((
+            RawFieldView::new(key, &self.pool, message, false, false, false),
+            RawFieldView::new(value, &self.pool, message, false, false, false),
+        ))
+    }
+
     /// Gets the containing message that this field extends.
     pub fn containing_message(&self) -> MessageDescriptor {
         MessageDescriptor {
@@ -1326,10 +1370,6 @@ impl ExtensionDescriptor {
         } else {
             self.kind().default_value()
         }
-    }
-
-    pub(crate) fn is_packable(&self) -> bool {
-        self.inner().kind.is_packable()
     }
 
     fn inner(&self) -> &ExtensionDescriptorInner {

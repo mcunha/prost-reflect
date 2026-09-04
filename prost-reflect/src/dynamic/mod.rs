@@ -29,7 +29,8 @@ use prost::{
 
 use self::fields::DynamicMessageFieldSet;
 use crate::{
-    descriptor::Kind, ExtensionDescriptor, FieldDescriptor, MessageDescriptor, ReflectMessage,
+    descriptor::{Kind, KindIndex},
+    ExtensionDescriptor, FieldDescriptor, MessageDescriptor, ReflectMessage,
 };
 
 /// [`DynamicMessage`] provides encoding, decoding and reflection of a protobuf message.
@@ -592,6 +593,110 @@ impl ReflectMessage for DynamicMessage {
         Self: Sized,
     {
         self.clone()
+    }
+}
+
+/// C1: canonical no-presence default exclusion, shared by the encode
+/// guard and the set-field iterator. Mirrors `default_value()` ordering:
+/// container default (empty list/map) first, then any declared default,
+/// then the kind zero - so the two encode-side surfaces can never drift
+/// and hand-built pools with declared defaults on presence-less fields
+/// keep the pre-C1 equality semantics.
+pub(super) fn is_default_for_field_parts(
+    value: &Value,
+    is_list: bool,
+    is_map: bool,
+    kind: KindIndex,
+    declared_default: Option<&Value>,
+) -> bool {
+    if is_list {
+        return matches!(value, Value::List(list) if list.is_empty());
+    }
+    if is_map {
+        return matches!(value, Value::Map(map) if map.is_empty());
+    }
+    if let Some(default) = declared_default {
+        return value == default;
+    }
+    match (value, kind) {
+        (Value::Bool(v), KindIndex::Bool) => !*v,
+        (Value::I32(v), KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32) => *v == 0,
+        (Value::I64(v), KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64) => *v == 0,
+        (Value::U32(v), KindIndex::Uint32 | KindIndex::Fixed32) => *v == 0,
+        (Value::U64(v), KindIndex::Uint64 | KindIndex::Fixed64) => *v == 0,
+        (Value::F32(v), KindIndex::Float) => *v == 0.0,
+        (Value::F64(v), KindIndex::Double) => *v == 0.0,
+        (Value::String(v), KindIndex::String) => v.is_empty(),
+        (Value::Bytes(v), KindIndex::Bytes) => v.is_empty(),
+        (Value::EnumNumber(v), KindIndex::Enum(_)) => *v == 0,
+        _ => false,
+    }
+}
+
+/// Kind-zero default for scalar/enum/string/bytes kinds; message/group
+/// kinds need a descriptor (handled by the caller via message_descriptor).
+pub(super) fn value_default_for_kind_index(
+    kind: KindIndex,
+    enum_default: Option<i32>,
+    message_desc: Option<MessageDescriptor>,
+) -> Value {
+    match kind {
+        KindIndex::Double => Value::F64(0.0),
+        KindIndex::Float => Value::F32(0.0),
+        KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32 => Value::I32(0),
+        KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64 => Value::I64(0),
+        KindIndex::Uint32 | KindIndex::Fixed32 => Value::U32(0),
+        KindIndex::Uint64 | KindIndex::Fixed64 => Value::U64(0),
+        KindIndex::Bool => Value::Bool(false),
+        KindIndex::String => Value::String(String::new()),
+        KindIndex::Bytes => Value::Bytes(Default::default()),
+        KindIndex::Enum(_) => {
+            Value::EnumNumber(enum_default.expect("enum kind needs its first-declared number"))
+        }
+        KindIndex::Message(_) | KindIndex::Group(_) => Value::Message(DynamicMessage::new(
+            message_desc.expect("message kind needs a descriptor for its default"),
+        )),
+    }
+}
+
+/// MapKey default for a key kind (keys are scalar kinds only).
+pub(super) fn mapkey_default_for_kind_index(kind: KindIndex) -> MapKey {
+    match kind {
+        KindIndex::Bool => MapKey::Bool(false),
+        KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32 => MapKey::I32(0),
+        KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64 => MapKey::I64(0),
+        KindIndex::Uint32 | KindIndex::Fixed32 => MapKey::U32(0),
+        KindIndex::Uint64 | KindIndex::Fixed64 => MapKey::U64(0),
+        KindIndex::String => MapKey::String(String::new()),
+        other => panic!("invalid map key kind {other:?}"),
+    }
+}
+
+pub(super) fn wire_type_for_kind_index(kind: KindIndex) -> prost::encoding::WireType {
+    match kind {
+        KindIndex::Double | KindIndex::Fixed64 | KindIndex::Sfixed64 => {
+            prost::encoding::WireType::SixtyFourBit
+        }
+        KindIndex::Float | KindIndex::Fixed32 | KindIndex::Sfixed32 => {
+            prost::encoding::WireType::ThirtyTwoBit
+        }
+        KindIndex::String | KindIndex::Bytes | KindIndex::Message(_) | KindIndex::Group(_) => {
+            prost::encoding::WireType::LengthDelimited
+        }
+        _ => prost::encoding::WireType::Varint,
+    }
+}
+
+/// Map-key zero check (map keys have no declared defaults).
+pub(super) fn is_default_mapkey(key: &MapKey, kind: KindIndex) -> bool {
+    match (key, kind) {
+        (MapKey::Bool(v), KindIndex::Bool) => !*v,
+        (MapKey::I32(v), KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32) => *v == 0,
+        (MapKey::I64(v), KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64) => *v == 0,
+        (MapKey::U32(v), KindIndex::Uint32 | KindIndex::Fixed32) => *v == 0,
+        (MapKey::U64(v), KindIndex::Uint64 | KindIndex::Fixed64) => *v == 0,
+        (MapKey::String(v), KindIndex::String) => v.is_empty(),
+        _ => false,
     }
 }
 
@@ -1163,10 +1268,36 @@ impl fmt::Display for Value {
 }
 
 #[test]
+fn value_default_enum_uses_first_declared_number() {
+    // proto2 implicit enum default is the first DECLARED number, which
+    // hand-built pools may set nonzero; the kind-index default must take
+    // it from the caller (RawFieldView::enum_default), never hardcode 0
+    assert_eq!(
+        value_default_for_kind_index(KindIndex::Enum(0), Some(7), None),
+        Value::EnumNumber(7)
+    );
+    assert_eq!(
+        value_default_for_kind_index(KindIndex::Enum(0), Some(-1), None),
+        Value::EnumNumber(-1)
+    );
+}
+
+#[test]
 #[cfg(target_arch = "x86_64")]
 fn type_sizes() {
+    use crate::descriptor::{DescriptorPool, EnumDescriptor, FieldDescriptor, MessageDescriptor};
     assert_eq!(std::mem::size_of::<DynamicMessage>(), 40);
     assert_eq!(std::mem::size_of::<Value>(), 56);
+    // Hot handles and the pool: tier1 C1/C4 must not grow these silently.
+    // Layout: DescriptorPool is a bare Arc; Message/EnumDescriptor are
+    // (pool Arc, u32 index); FieldDescriptor nests a MessageDescriptor
+    // plus a field index (hence 24, not 16). Note x86_64 padding granularity:
+    // FieldDescriptor carries 20 real bytes, so <=4 bytes of additions do
+    // not trip these pins - they are a coarse bloat guard, not exact.
+    assert_eq!(std::mem::size_of::<FieldDescriptor>(), 24);
+    assert_eq!(std::mem::size_of::<MessageDescriptor>(), 16);
+    assert_eq!(std::mem::size_of::<EnumDescriptor>(), 16);
+    assert_eq!(std::mem::size_of::<DescriptorPool>(), 8);
 }
 
 pub(crate) enum Either<L, R> {

@@ -166,6 +166,8 @@ where
                 }
                 self.fmt_field_value(&value, Some(&desc.kind()))
             }
+            // iter() never yields View (encode path only); kept for
+            // exhaustive matching
             ValueAndDescriptor::Extension(value, desc) => {
                 write!(self.f, "[{}]", desc.full_name())?;
                 self.fmt_field_value(&value, Some(&desc.kind()))
