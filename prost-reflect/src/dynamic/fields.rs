@@ -32,8 +32,10 @@ pub(crate) trait FieldDescriptorLike: fmt::Debug {
 ///
 /// C4: stored as a `Vec` kept sorted by field number (the same ascending
 /// order a `BTreeMap` yielded), so sparse set-field iteration stays in a
-/// valid protobuf wire order while lookups are binary searches and decode
-/// insertion appends with near-zero cost. `Taken` is only ever transient,
+/// valid protobuf wire order while lookups are binary searches and
+/// wire-ascending decode insertion into an empty set appends with
+/// near-zero cost (mid-vector inserts shift O(n) per occurrence; see the
+/// C4 risk note in the tier1 design doc). `Taken` is only ever transient,
 /// mid-iteration (draining iterators replace entries in place).
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(super) struct DynamicMessageFieldSet {

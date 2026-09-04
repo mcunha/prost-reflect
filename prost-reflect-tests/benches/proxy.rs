@@ -15,45 +15,15 @@ use prost::Message;
 use prost_reflect::{
     DescriptorPool, DeserializeOptions, DynamicMessage, ReflectMessage, SerializeOptions, Value,
 };
-use prost_reflect_tests::proto::{ComplexType, Scalars};
+use prost_reflect_tests::proto::ComplexType;
+
+mod samples;
+use samples::{complex_sample, scalars_sample};
+use prost_reflect_tests::proto::Scalars;
 use prost_reflect_tests::test_file_descriptor;
 
 const DESCRIPTOR_SET_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin"));
-
-fn scalars_sample() -> Scalars {
-    Scalars {
-        double: 1.1,
-        float: 2.2,
-        int32: -3,
-        int64: 4,
-        uint32: 5,
-        uint64: 6,
-        sint32: -7,
-        sint64: 8,
-        fixed32: 9,
-        fixed64: 10,
-        sfixed32: -11,
-        sfixed64: 12,
-        bool: true,
-        string: "hello".to_owned(),
-        bytes: b"world".to_vec(),
-    }
-}
-
-fn complex_sample() -> ComplexType {
-    ComplexType {
-        string_map: HashMap::from_iter([
-            ("one".to_owned(), scalars_sample()),
-            ("two".to_owned(), scalars_sample()),
-        ]),
-        int_map: HashMap::from_iter([(1, scalars_sample())]),
-        nested: Some(scalars_sample()),
-        my_enum: vec![0, 1, 3],
-        optional_enum: 1,
-        enum_map: HashMap::from_iter([(1, 3), (2, 0)]),
-    }
-}
 
 /// Scalars payload with trailing fields unknown to the descriptor
 /// (100-104): a proxy decoding a message from a newer backend version.
@@ -129,6 +99,14 @@ fn scalars_with_group_unknowns() -> Vec<u8> {
 }
 
 fn pool_summary() {
+    // Heavy side-effect setup (50 pool decodes for a publish print) runs at
+    // group registration, i.e. in EVERY process execution even when the
+    // criterion filter selects a different bench - which pollutes whole-
+    // process profilers (callgrind counts setup, not just the measured
+    // loop). PROXY_SKIP_SETUP is set by scripts/profile_callgrind.sh.
+    if std::env::var_os("PROXY_SKIP_SETUP").is_some() {
+        return;
+    }
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let pool = DescriptorPool::decode(DESCRIPTOR_SET_BYTES)
@@ -153,6 +131,9 @@ fn wkt_global_pool_init(_c: &mut Criterion) {
     // registers no criterion benchmark, so the parameter stays unused.
     // One-time startup cost: global well-known-types pool. This must be the
     // first bench to run (it is), so nothing has touched the global pool yet.
+    if std::env::var_os("PROXY_SKIP_SETUP").is_some() {
+        return;
+    }
     let t0 = Instant::now();
     let pool = DescriptorPool::global();
     let ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -477,6 +458,13 @@ fn encode_complex_mt(c: &mut Criterion, threads: usize, per_batch: usize, reuse:
 }
 
 fn encode_complex_mt_benches(c: &mut Criterion) {
+    // MT benches are multithreaded measurement targets, not single-thread
+    // perf signals; PROXY_SKIP_MT (set by scripts/profile_callgrind.sh)
+    // keeps them out of profiler runs, where the substring filter for the
+    // plain encode_complex_dynamic bench would otherwise drag them in.
+    if std::env::var_os("PROXY_SKIP_MT").is_some() {
+        return;
+    }
     encode_complex_mt(c, 1, 200, false);
     encode_complex_mt(c, 4, 200, false);
     encode_complex_mt(c, 16, 200, false);
@@ -549,6 +537,13 @@ fn encode_complex_mt_pinned(c: &mut Criterion, threads: usize, per_batch: usize)
 }
 
 fn encode_complex_mt_pinned_benches(c: &mut Criterion) {
+    // MT benches are multithreaded measurement targets, not single-thread
+    // perf signals; PROXY_SKIP_MT (set by scripts/profile_callgrind.sh)
+    // keeps them out of profiler runs, where the substring filter for the
+    // plain encode_complex_dynamic bench would otherwise drag them in.
+    if std::env::var_os("PROXY_SKIP_MT").is_some() {
+        return;
+    }
     encode_complex_mt_pinned(c, 8, 200);
     encode_complex_mt_pinned(c, 16, 200);
 }
@@ -585,6 +580,13 @@ fn encode_static_mt(c: &mut Criterion, threads: usize, per_batch: usize) {
 }
 
 fn encode_static_mt_benches(c: &mut Criterion) {
+    // MT benches are multithreaded measurement targets, not single-thread
+    // perf signals; PROXY_SKIP_MT (set by scripts/profile_callgrind.sh)
+    // keeps them out of profiler runs, where the substring filter for the
+    // plain encode_complex_dynamic bench would otherwise drag them in.
+    if std::env::var_os("PROXY_SKIP_MT").is_some() {
+        return;
+    }
     encode_static_mt(c, 1, 2000);
     encode_static_mt(c, 4, 2000);
     encode_static_mt(c, 16, 2000);
