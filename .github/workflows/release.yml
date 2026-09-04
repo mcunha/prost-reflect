@@ -19,13 +19,14 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # was actions/checkout@v7 (pinned)
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # dtolnay/rust-toolchain@stable (pinned; bump ref+sha together)
       - name: Run release-plz
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260  # release-plz/action@v0.5 (pinned; bump ref+sha together)
         with:
           command: release
         env:
@@ -44,13 +45,14 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # was actions/checkout@v7 (pinned)
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # dtolnay/rust-toolchain@stable (pinned; bump ref+sha together)
       - name: Run release-plz
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@b5543c19b03be9bd48852d20ca89f478b7723260  # release-plz/action@v0.5 (pinned; bump ref+sha together)
         with:
           command: release-pr
         env:

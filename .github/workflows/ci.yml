@@ -8,6 +8,9 @@ on:
 
 name: Continuous integration
 
+permissions:
+  contents: read
+
 env:
   PROTOC_VERSION: "3.25.3"
 
@@ -19,19 +22,20 @@ jobs:
       matrix:
         rust: [beta, stable, 1.82.0]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7 (pinned; bump ref+sha together)
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@master
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # dtolnay/rust-toolchain@master (pinned; bump ref+sha together)
         with:
           toolchain: ${{ matrix.rust }}
       # Skip cargo update for MSRV validation build
       - run: cargo update
         if: ${{ matrix.rust == 'stable' || matrix.rust == 'beta' }}
       - name: Get latest CMake and ninja
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@5ef766c8ab411a29af509ca0b98737809e47b092  # lukka/get-cmake@latest (pinned; bump ref+sha together)
       - name: install protoc
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8  # taiki-e/install-action@v2 (pinned; bump ref+sha together)
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - run: cargo test --all-features
@@ -40,17 +44,18 @@ jobs:
     name: Lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7 (pinned; bump ref+sha together)
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@master
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0  # dtolnay/rust-toolchain@master (pinned; bump ref+sha together)
         with:
           toolchain: stable
           components: clippy, rustfmt
       - name: Get latest CMake and ninja
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@5ef766c8ab411a29af509ca0b98737809e47b092  # lukka/get-cmake@latest (pinned; bump ref+sha together)
       - name: install protoc
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8  # taiki-e/install-action@v2 (pinned; bump ref+sha together)
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - run: cargo fmt --all -- --check
@@ -75,18 +80,19 @@ jobs:
       image: xd009642/tarpaulin:develop
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # actions/checkout@v7 (pinned; bump ref+sha together)
         with:
           submodules: recursive
+          persist-credentials: false
       - name: install protoc
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8  # taiki-e/install-action@v2 (pinned; bump ref+sha together)
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Generate code coverage
         run: |
           cargo tarpaulin --verbose --packages prost-reflect prost-reflect-tests --all-features --timeout 120 --out xml
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238  # codecov/codecov-action@v4 (pinned; bump ref+sha together)
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
