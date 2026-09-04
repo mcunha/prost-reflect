@@ -6,26 +6,23 @@ use prost::{
 
 use crate::{
     descriptor::{
-        FieldDescriptor, Kind, KindIndex, RawFieldView, MAP_ENTRY_KEY_NUMBER,
+        Kind, KindIndex, MessageDescriptor, RawFieldView, MAP_ENTRY_KEY_NUMBER,
         MAP_ENTRY_VALUE_NUMBER,
     },
     DynamicMessage, MapKey, Value,
 };
 
-use super::{
-    fields::{FieldDescriptorLike, ValueAndDescriptor},
-    unknown::UnknownField,
-};
+use super::{fields::ValueAndDescriptor, unknown::UnknownField};
 
-/// The handle-free description surface the encode path needs (C1).
+/// The handle-free description surface the wire codecs need (C1):
+/// used by the encode dispatch AND the decode/merge dispatch, so
+/// neither direction builds `FieldDescriptor` handles per occurrence.
 ///
 /// Implemented by the borrowed [`RawFieldView`] the set-field iterator
 /// yields (no Arc refcount traffic, map entries resolved once per map
-/// field) and by [`ExtensionDescriptor`] for the extension encode arm.
-/// The decode/merge path and the serde/text-format serializers use
-/// `FieldDescriptorLike`/their own serializers and never see this
-/// trait.
-pub(super) trait EncodeFieldDesc {
+/// field) and by [`ExtensionDescriptor`] for the extension arms.
+/// Serializers use `FieldDescriptorLike`/their own serializers.
+pub(super) trait WireFieldDesc {
     fn number(&self) -> u32;
     fn supports_presence(&self) -> bool;
     fn is_default_value(&self, value: &Value) -> bool;
@@ -34,13 +31,28 @@ pub(super) trait EncodeFieldDesc {
     fn is_list(&self) -> bool;
     fn is_map(&self) -> bool;
     fn is_packed(&self) -> bool;
+    fn is_packable(&self) -> bool;
+    /// Wire type of this field's kind (decode element loops).
+    fn wire_type(&self) -> prost::encoding::WireType {
+        super::wire_type_for_kind_index(self.kind_index())
+    }
+    /// Message descriptor for message/group kinds (decode element
+    /// defaults); None for scalar kinds.
+    fn kind_message_descriptor(&self) -> Option<MessageDescriptor> {
+        None
+    }
+    /// First-declared number of an enum-kind field (proto2 implicit
+    /// default); None for non-enum kinds.
+    fn enum_default_value(&self) -> Option<i32> {
+        None
+    }
     /// Key/value field views of a map field, resolved once per field.
     /// Every implementer provides the real resolution (a default of None
     /// would make the map arm panic for that descriptor kind).
     fn map_entry_fields(&self) -> Option<(RawFieldView<'_>, RawFieldView<'_>)>;
 }
 
-impl EncodeFieldDesc for RawFieldView<'_> {
+impl WireFieldDesc for RawFieldView<'_> {
     fn number(&self) -> u32 {
         RawFieldView::number(self)
     }
@@ -79,12 +91,24 @@ impl EncodeFieldDesc for RawFieldView<'_> {
         RawFieldView::is_packed(self)
     }
 
+    fn is_packable(&self) -> bool {
+        self.is_list && RawFieldView::kind_index(self).is_packable()
+    }
+
+    fn kind_message_descriptor(&self) -> Option<MessageDescriptor> {
+        RawFieldView::message_descriptor(self)
+    }
+
+    fn enum_default_value(&self) -> Option<i32> {
+        RawFieldView::enum_default(self)
+    }
+
     fn map_entry_fields(&self) -> Option<(RawFieldView<'_>, RawFieldView<'_>)> {
         RawFieldView::map_entry_fields(self)
     }
 }
 
-impl EncodeFieldDesc for crate::ExtensionDescriptor {
+impl WireFieldDesc for crate::ExtensionDescriptor {
     fn number(&self) -> u32 {
         self.number()
     }
@@ -109,8 +133,46 @@ impl EncodeFieldDesc for crate::ExtensionDescriptor {
     fn is_packed(&self) -> bool {
         self.is_packed()
     }
+    fn is_packable(&self) -> bool {
+        // No inherent ExtensionDescriptor::is_packable: direct trait call
+        // would recurse; list + packable kind is the definition.
+        self.is_list() && self.kind_index_inner().is_packable()
+    }
+    fn kind_message_descriptor(&self) -> Option<MessageDescriptor> {
+        match self.kind() {
+            Kind::Message(desc) => Some(desc),
+            _ => None,
+        }
+    }
+
+    fn enum_default_value(&self) -> Option<i32> {
+        match self.kind() {
+            Kind::Enum(desc) => Some(desc.default_value().number()),
+            _ => None,
+        }
+    }
+
     fn map_entry_fields(&self) -> Option<(RawFieldView<'_>, RawFieldView<'_>)> {
         self.map_entry_views()
+    }
+}
+
+/// Default value for an absent field (decode insertion): containers,
+/// declared default, then kind default (message/group need the
+/// descriptor; enum needs the first-declared number).
+fn rawfield_absent_value(view: &RawFieldView<'_>) -> Value {
+    if view.is_list {
+        Value::List(Vec::new())
+    } else if view.is_map {
+        Value::Map(Default::default())
+    } else if let Some(declared) = view.declared_default() {
+        declared.clone()
+    } else {
+        super::value_default_for_kind_index(
+            view.kind_index(),
+            view.enum_default(),
+            view.message_descriptor(),
+        )
     }
 }
 
@@ -143,9 +205,16 @@ impl Message for DynamicMessage {
     where
         Self: Sized,
     {
-        if let Some(field_desc) = self.desc.get_field(number) {
-            self.get_field_mut(&field_desc)
-                .merge_field(&field_desc, wire_type, buf, ctx)
+        if let Some(view) = self.desc.field_view(number) {
+            if let Some(siblings) = view.oneof_sibling_numbers(number) {
+                for sibling in siblings {
+                    self.fields.clear_by_number(sibling);
+                }
+            }
+            let default = rawfield_absent_value(&view);
+            self.fields
+                .decode_entry(number, default)
+                .merge_field(&view, wire_type, buf, ctx)
         } else if let Some(extension_desc) = self.desc.get_extension(number) {
             self.get_extension_mut(&extension_desc).merge_field(
                 &extension_desc,
@@ -185,7 +254,7 @@ impl Message for DynamicMessage {
 }
 
 impl Value {
-    pub(super) fn encode_field<B>(&self, field_desc: &impl EncodeFieldDesc, buf: &mut B)
+    pub(super) fn encode_field<B>(&self, field_desc: &impl WireFieldDesc, buf: &mut B)
     where
         B: BufMut,
     {
@@ -384,7 +453,7 @@ impl Value {
 
     pub(super) fn merge_field<B>(
         &mut self,
-        field_desc: &impl FieldDescriptorLike,
+        field_desc: &impl WireFieldDesc,
         wire_type: WireType,
         buf: &mut B,
         ctx: DecodeContext,
@@ -392,83 +461,92 @@ impl Value {
     where
         B: Buf,
     {
-        match (self, field_desc.kind()) {
-            (Value::Bool(value), Kind::Bool) => {
+        match (self, field_desc.kind_index()) {
+            (Value::Bool(value), KindIndex::Bool) => {
                 prost::encoding::bool::merge(wire_type, value, buf, ctx)
             }
-            (Value::I32(value), Kind::Int32) => {
+            (Value::I32(value), KindIndex::Int32) => {
                 prost::encoding::int32::merge(wire_type, value, buf, ctx)
             }
-            (Value::I32(value), Kind::Sint32) => {
+            (Value::I32(value), KindIndex::Sint32) => {
                 prost::encoding::sint32::merge(wire_type, value, buf, ctx)
             }
-            (Value::I32(value), Kind::Sfixed32) => {
+            (Value::I32(value), KindIndex::Sfixed32) => {
                 prost::encoding::sfixed32::merge(wire_type, value, buf, ctx)
             }
-            (Value::I64(value), Kind::Int64) => {
+            (Value::I64(value), KindIndex::Int64) => {
                 prost::encoding::int64::merge(wire_type, value, buf, ctx)
             }
-            (Value::I64(value), Kind::Sint64) => {
+            (Value::I64(value), KindIndex::Sint64) => {
                 prost::encoding::sint64::merge(wire_type, value, buf, ctx)
             }
-            (Value::I64(value), Kind::Sfixed64) => {
+            (Value::I64(value), KindIndex::Sfixed64) => {
                 prost::encoding::sfixed64::merge(wire_type, value, buf, ctx)
             }
-            (Value::U32(value), Kind::Uint32) => {
+            (Value::U32(value), KindIndex::Uint32) => {
                 prost::encoding::uint32::merge(wire_type, value, buf, ctx)
             }
-            (Value::U32(value), Kind::Fixed32) => {
+            (Value::U32(value), KindIndex::Fixed32) => {
                 prost::encoding::fixed32::merge(wire_type, value, buf, ctx)
             }
-            (Value::U64(value), Kind::Uint64) => {
+            (Value::U64(value), KindIndex::Uint64) => {
                 prost::encoding::uint64::merge(wire_type, value, buf, ctx)
             }
-            (Value::U64(value), Kind::Fixed64) => {
+            (Value::U64(value), KindIndex::Fixed64) => {
                 prost::encoding::fixed64::merge(wire_type, value, buf, ctx)
             }
-            (Value::F32(value), Kind::Float) => {
+            (Value::F32(value), KindIndex::Float) => {
                 prost::encoding::float::merge(wire_type, value, buf, ctx)
             }
-            (Value::F64(value), Kind::Double) => {
+            (Value::F64(value), KindIndex::Double) => {
                 prost::encoding::double::merge(wire_type, value, buf, ctx)
             }
-            (Value::String(value), Kind::String) => {
+            (Value::String(value), KindIndex::String) => {
                 prost::encoding::string::merge(wire_type, value, buf, ctx)
             }
-            (Value::Bytes(value), Kind::Bytes) => {
+            (Value::Bytes(value), KindIndex::Bytes) => {
                 prost::encoding::bytes::merge(wire_type, value, buf, ctx)
             }
-            (Value::EnumNumber(value), Kind::Enum(_)) => {
+            (Value::EnumNumber(value), KindIndex::Enum(_)) => {
                 prost::encoding::int32::merge(wire_type, value, buf, ctx)
             }
-            (Value::Message(message), Kind::Message(_)) => {
+            (Value::Message(message), KindIndex::Message(_) | KindIndex::Group(_)) => {
                 if field_desc.is_group() {
                     prost::encoding::group::merge(field_desc.number(), wire_type, message, buf, ctx)
                 } else {
                     prost::encoding::message::merge(wire_type, message, buf, ctx)
                 }
             }
-            (Value::List(values), field_kind) if field_desc.is_list() => {
+            (Value::List(values), _) if field_desc.is_list() => {
                 if wire_type == WireType::LengthDelimited && field_desc.is_packable() {
                     prost::encoding::merge_loop(values, buf, ctx, |values, buf, ctx| {
-                        let mut value = Value::default_value(&field_kind);
-                        value.merge_field(field_desc, field_kind.wire_type(), buf, ctx)?;
+                        let mut value = super::value_default_for_kind_index(
+                            field_desc.kind_index(),
+                            field_desc.enum_default_value(),
+                            field_desc.kind_message_descriptor(),
+                        );
+                        value.merge_field(field_desc, field_desc.wire_type(), buf, ctx)?;
                         values.push(value);
                         Ok(())
                     })
                 } else {
-                    let mut value = Value::default_value(&field_kind);
+                    let mut value = super::value_default_for_kind_index(
+                        field_desc.kind_index(),
+                        field_desc.enum_default_value(),
+                        field_desc.kind_message_descriptor(),
+                    );
                     value.merge_field(field_desc, wire_type, buf, ctx)?;
                     values.push(value);
                     Ok(())
                 }
             }
-            (Value::Map(values), Kind::Message(map_entry)) if field_desc.is_map() => {
-                let key_desc = map_entry.get_field(MAP_ENTRY_KEY_NUMBER).unwrap();
-                let value_desc = map_entry.get_field(MAP_ENTRY_VALUE_NUMBER).unwrap();
+            (Value::Map(values), _) if field_desc.is_map() => {
+                let (key_view, value_view) = field_desc
+                    .map_entry_fields()
+                    .expect("map field must have an entry key and value");
 
-                let mut key = MapKey::default_value(&key_desc.kind());
-                let mut value = Value::default_value_for_field(&value_desc);
+                let mut key = super::mapkey_default_for_kind_index(key_view.kind_index());
+                let mut value = rawfield_absent_value(&value_view);
                 prost::encoding::merge_loop(
                     &mut (&mut key, &mut value),
                     buf,
@@ -476,9 +554,9 @@ impl Value {
                     |(key, value), buf, ctx| {
                         let (number, wire_type) = prost::encoding::decode_key(buf)?;
                         match number {
-                            MAP_ENTRY_KEY_NUMBER => key.merge_field(&key_desc, wire_type, buf, ctx),
+                            MAP_ENTRY_KEY_NUMBER => key.merge_field(&key_view, wire_type, buf, ctx),
                             MAP_ENTRY_VALUE_NUMBER => {
-                                value.merge_field(&value_desc, wire_type, buf, ctx)
+                                value.merge_field(&value_view, wire_type, buf, ctx)
                             }
                             _ => prost::encoding::skip_field(wire_type, number, buf, ctx),
                         }
@@ -494,7 +572,7 @@ impl Value {
         }
     }
 
-    pub(super) fn encoded_len(&self, field_desc: &impl EncodeFieldDesc) -> usize {
+    pub(super) fn encoded_len(&self, field_desc: &impl WireFieldDesc) -> usize {
         if !field_desc.supports_presence() && field_desc.is_default_value(self) {
             return 0;
         }
@@ -663,7 +741,7 @@ impl Value {
 }
 
 impl MapKey {
-    fn encode_field<B>(&self, field_desc: &impl EncodeFieldDesc, buf: &mut B)
+    fn encode_field<B>(&self, field_desc: &impl WireFieldDesc, buf: &mut B)
     where
         B: BufMut,
     {
@@ -719,7 +797,7 @@ impl MapKey {
 
     fn merge_field<B>(
         &mut self,
-        field_desc: &FieldDescriptor,
+        field_desc: &impl WireFieldDesc,
         wire_type: WireType,
         buf: &mut B,
         ctx: DecodeContext,
@@ -727,41 +805,41 @@ impl MapKey {
     where
         B: Buf,
     {
-        match (self, field_desc.kind()) {
-            (MapKey::Bool(value), Kind::Bool) => {
+        match (self, field_desc.kind_index()) {
+            (MapKey::Bool(value), KindIndex::Bool) => {
                 prost::encoding::bool::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I32(value), Kind::Int32) => {
+            (MapKey::I32(value), KindIndex::Int32) => {
                 prost::encoding::int32::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I32(value), Kind::Sint32) => {
+            (MapKey::I32(value), KindIndex::Sint32) => {
                 prost::encoding::sint32::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I32(value), Kind::Sfixed32) => {
+            (MapKey::I32(value), KindIndex::Sfixed32) => {
                 prost::encoding::sfixed32::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I64(value), Kind::Int64) => {
+            (MapKey::I64(value), KindIndex::Int64) => {
                 prost::encoding::int64::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I64(value), Kind::Sint64) => {
+            (MapKey::I64(value), KindIndex::Sint64) => {
                 prost::encoding::sint64::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::I64(value), Kind::Sfixed64) => {
+            (MapKey::I64(value), KindIndex::Sfixed64) => {
                 prost::encoding::sfixed64::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::U32(value), Kind::Uint32) => {
+            (MapKey::U32(value), KindIndex::Uint32) => {
                 prost::encoding::uint32::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::U32(value), Kind::Fixed32) => {
+            (MapKey::U32(value), KindIndex::Fixed32) => {
                 prost::encoding::fixed32::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::U64(value), Kind::Uint64) => {
+            (MapKey::U64(value), KindIndex::Uint64) => {
                 prost::encoding::uint64::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::U64(value), Kind::Fixed64) => {
+            (MapKey::U64(value), KindIndex::Fixed64) => {
                 prost::encoding::fixed64::merge(wire_type, value, buf, ctx)
             }
-            (MapKey::String(value), Kind::String) => {
+            (MapKey::String(value), KindIndex::String) => {
                 prost::encoding::string::merge(wire_type, value, buf, ctx)
             }
             (value, ty) => {
@@ -770,7 +848,7 @@ impl MapKey {
         }
     }
 
-    fn encoded_len(&self, field_desc: &impl EncodeFieldDesc) -> usize {
+    fn encoded_len(&self, field_desc: &impl WireFieldDesc) -> usize {
         if !field_desc.supports_presence()
             && super::is_default_mapkey(self, field_desc.kind_index())
         {

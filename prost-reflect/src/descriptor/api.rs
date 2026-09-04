@@ -969,7 +969,7 @@ impl MessageDescriptor {
         let is_group = matches!(inner.kind, KindIndex::Group(_));
         let is_list = inner.cardinality == Cardinality::Repeated && !is_map;
         Some(RawFieldView::new(
-            inner, &self.pool, is_list, is_map, is_group,
+            inner, &self.pool, self.index, is_list, is_map, is_group,
         ))
     }
 
@@ -1138,10 +1138,6 @@ impl FieldDescriptor {
         } else {
             self.kind().default_value()
         }
-    }
-
-    pub(crate) fn is_packable(&self) -> bool {
-        self.inner().kind.is_packable()
     }
 
     fn inner(&self) -> &FieldDescriptorInner {
@@ -1337,8 +1333,8 @@ impl ExtensionDescriptor {
         let key = entry.field_by_number(MAP_ENTRY_KEY_NUMBER)?;
         let value = entry.field_by_number(MAP_ENTRY_VALUE_NUMBER)?;
         Some((
-            RawFieldView::new(key, &self.pool, false, false, false),
-            RawFieldView::new(value, &self.pool, false, false, false),
+            RawFieldView::new(key, &self.pool, message, false, false, false),
+            RawFieldView::new(value, &self.pool, message, false, false, false),
         ))
     }
 
@@ -1364,10 +1360,6 @@ impl ExtensionDescriptor {
         } else {
             self.kind().default_value()
         }
-    }
-
-    pub(crate) fn is_packable(&self) -> bool {
-        self.inner().kind.is_packable()
     }
 
     fn inner(&self) -> &ExtensionDescriptorInner {

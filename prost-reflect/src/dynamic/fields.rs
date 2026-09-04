@@ -26,10 +26,8 @@ pub(crate) trait FieldDescriptorLike: fmt::Debug {
     fn containing_oneof(&self) -> Option<OneofDescriptor>;
     fn supports_presence(&self) -> bool;
     fn kind(&self) -> Kind;
-    fn is_group(&self) -> bool;
     fn is_list(&self) -> bool;
     fn is_map(&self) -> bool;
-    fn is_packable(&self) -> bool;
     fn has(&self, value: &Value) -> bool {
         self.supports_presence() || !self.is_default_value(value)
     }
@@ -95,6 +93,28 @@ impl DynamicMessageFieldSet {
                 .insert(ValueOrUnknown::Value(desc.default_value()))
                 .unwrap_value_mut(),
         }
+    }
+
+    /// Decode: return the mutable slot for `number`, inserting `default`
+    /// when the slot is absent or holds non-value state. Oneof sibling
+    /// clearing is the caller's job via `clear_by_number`.
+    pub(super) fn decode_entry(&mut self, number: u32, default: Value) -> &mut Value {
+        match self.fields.entry(number) {
+            btree_map::Entry::Occupied(entry) => match entry.into_mut() {
+                ValueOrUnknown::Value(value) => value,
+                slot => {
+                    *slot = ValueOrUnknown::Value(default);
+                    slot.unwrap_value_mut()
+                }
+            },
+            btree_map::Entry::Vacant(entry) => entry
+                .insert(ValueOrUnknown::Value(default))
+                .unwrap_value_mut(),
+        }
+    }
+
+    pub(super) fn clear_by_number(&mut self, number: u32) {
+        self.fields.remove(&number);
     }
 
     pub(super) fn set(&mut self, desc: &impl FieldDescriptorLike, value: Value) {
@@ -467,20 +487,12 @@ impl FieldDescriptorLike for FieldDescriptor {
         self.kind()
     }
 
-    fn is_group(&self) -> bool {
-        self.is_group()
-    }
-
     fn is_list(&self) -> bool {
         self.is_list()
     }
 
     fn is_map(&self) -> bool {
         self.is_map()
-    }
-
-    fn is_packable(&self) -> bool {
-        self.is_packable()
     }
 }
 
@@ -518,19 +530,11 @@ impl FieldDescriptorLike for ExtensionDescriptor {
         self.kind()
     }
 
-    fn is_group(&self) -> bool {
-        self.is_group()
-    }
-
     fn is_list(&self) -> bool {
         self.is_list()
     }
 
     fn is_map(&self) -> bool {
         self.is_map()
-    }
-
-    fn is_packable(&self) -> bool {
-        self.is_packable()
     }
 }

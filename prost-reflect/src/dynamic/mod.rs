@@ -633,6 +633,60 @@ pub(super) fn is_default_for_field_parts(
     }
 }
 
+/// Kind-zero default for scalar/enum/string/bytes kinds; message/group
+/// kinds need a descriptor (handled by the caller via message_descriptor).
+pub(super) fn value_default_for_kind_index(
+    kind: KindIndex,
+    enum_default: Option<i32>,
+    message_desc: Option<MessageDescriptor>,
+) -> Value {
+    match kind {
+        KindIndex::Double => Value::F64(0.0),
+        KindIndex::Float => Value::F32(0.0),
+        KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32 => Value::I32(0),
+        KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64 => Value::I64(0),
+        KindIndex::Uint32 | KindIndex::Fixed32 => Value::U32(0),
+        KindIndex::Uint64 | KindIndex::Fixed64 => Value::U64(0),
+        KindIndex::Bool => Value::Bool(false),
+        KindIndex::String => Value::String(String::new()),
+        KindIndex::Bytes => Value::Bytes(Default::default()),
+        KindIndex::Enum(_) => {
+            Value::EnumNumber(enum_default.expect("enum kind needs its first-declared number"))
+        }
+        KindIndex::Message(_) | KindIndex::Group(_) => Value::Message(DynamicMessage::new(
+            message_desc.expect("message kind needs a descriptor for its default"),
+        )),
+    }
+}
+
+/// MapKey default for a key kind (keys are scalar kinds only).
+pub(super) fn mapkey_default_for_kind_index(kind: KindIndex) -> MapKey {
+    match kind {
+        KindIndex::Bool => MapKey::Bool(false),
+        KindIndex::Int32 | KindIndex::Sint32 | KindIndex::Sfixed32 => MapKey::I32(0),
+        KindIndex::Int64 | KindIndex::Sint64 | KindIndex::Sfixed64 => MapKey::I64(0),
+        KindIndex::Uint32 | KindIndex::Fixed32 => MapKey::U32(0),
+        KindIndex::Uint64 | KindIndex::Fixed64 => MapKey::U64(0),
+        KindIndex::String => MapKey::String(String::new()),
+        other => panic!("invalid map key kind {other:?}"),
+    }
+}
+
+pub(super) fn wire_type_for_kind_index(kind: KindIndex) -> prost::encoding::WireType {
+    match kind {
+        KindIndex::Double | KindIndex::Fixed64 | KindIndex::Sfixed64 => {
+            prost::encoding::WireType::SixtyFourBit
+        }
+        KindIndex::Float | KindIndex::Fixed32 | KindIndex::Sfixed32 => {
+            prost::encoding::WireType::ThirtyTwoBit
+        }
+        KindIndex::String | KindIndex::Bytes | KindIndex::Message(_) | KindIndex::Group(_) => {
+            prost::encoding::WireType::LengthDelimited
+        }
+        _ => prost::encoding::WireType::Varint,
+    }
+}
+
 /// Map-key zero check (map keys have no declared defaults).
 pub(super) fn is_default_mapkey(key: &MapKey, kind: KindIndex) -> bool {
     match (key, kind) {
@@ -1211,6 +1265,21 @@ impl fmt::Display for Value {
         text_format::Writer::new(text_format::FormatOptions::new().pretty(f.alternate()), f)
             .fmt_value(self, None)
     }
+}
+
+#[test]
+fn value_default_enum_uses_first_declared_number() {
+    // proto2 implicit enum default is the first DECLARED number, which
+    // hand-built pools may set nonzero; the kind-index default must take
+    // it from the caller (RawFieldView::enum_default), never hardcode 0
+    assert_eq!(
+        value_default_for_kind_index(KindIndex::Enum(0), Some(7), None),
+        Value::EnumNumber(7)
+    );
+    assert_eq!(
+        value_default_for_kind_index(KindIndex::Enum(0), Some(-1), None),
+        Value::EnumNumber(-1)
+    );
 }
 
 #[test]
