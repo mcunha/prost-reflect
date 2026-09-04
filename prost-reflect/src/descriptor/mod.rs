@@ -11,7 +11,7 @@ pub use self::error::DescriptorError;
 use self::types::{DescriptorProto, EnumDescriptorProto};
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     convert::TryInto,
     fmt,
     ops::Range,
@@ -109,6 +109,54 @@ enum KindIndex {
 
 type DescriptorIndex = u32;
 type FileIndex = DescriptorIndex;
+
+/// Number -> field-index lookup for one message: one Vec of (number,
+/// index) pairs kept sorted by number. Built once at pool load with the
+/// exact declared field count (one allocation per message, none during
+/// resolution); binary-search lookup; iteration is ascending field
+/// number, matching the previous BTreeMap semantics (C1's merge-walk
+/// relies on it).
+#[derive(Clone)]
+struct FieldNumberIndex {
+    entries: Vec<(u32, FieldIndex)>,
+}
+
+impl FieldNumberIndex {
+    /// Build-time constructor: the declared field count is known when the
+    /// message shell is created, so the Vec is pre-sized exactly and
+    /// resolution inserts never reallocate.
+    fn with_capacity(fields: usize) -> Self {
+        FieldNumberIndex {
+            entries: Vec::with_capacity(fields),
+        }
+    }
+
+    fn insert(&mut self, number: u32, index: FieldIndex) -> Option<FieldIndex> {
+        match self.entries.binary_search_by_key(&number, |e| e.0) {
+            Ok(pos) => {
+                let previous = self.entries[pos].1;
+                self.entries[pos].1 = index;
+                Some(previous)
+            }
+            Err(pos) => {
+                self.entries.insert(pos, (number, index));
+                None
+            }
+        }
+    }
+
+    fn get(&self, number: u32) -> Option<FieldIndex> {
+        self.entries
+            .binary_search_by_key(&number, |e| e.0)
+            .ok()
+            .map(|pos| self.entries[pos].1)
+    }
+
+    fn iter_indices(&self) -> impl ExactSizeIterator<Item = FieldIndex> + '_ {
+        self.entries.iter().map(|(_, index)| *index)
+    }
+}
+
 type ServiceIndex = DescriptorIndex;
 type MethodIndex = DescriptorIndex;
 type MessageIndex = DescriptorIndex;
@@ -200,7 +248,7 @@ struct MessageDescriptorInner {
     parent: Option<MessageIndex>,
     extensions: Vec<ExtensionIndex>,
     fields: Vec<FieldDescriptorInner>,
-    field_numbers: BTreeMap<u32, FieldIndex>,
+    field_numbers: FieldNumberIndex,
     field_names: HashMap<Box<str>, FieldIndex>,
     field_json_names: HashMap<Box<str>, FieldIndex>,
     oneofs: Vec<OneofDescriptorInner>,

@@ -770,8 +770,8 @@ impl MessageDescriptor {
     pub fn fields(&self) -> impl ExactSizeIterator<Item = FieldDescriptor> + '_ {
         self.inner()
             .field_numbers
-            .values()
-            .map(|&index| FieldDescriptor {
+            .iter_indices()
+            .map(|index| FieldDescriptor {
                 message: self.clone(),
                 index,
             })
@@ -852,8 +852,8 @@ impl MessageDescriptor {
     pub fn get_field(&self, number: u32) -> Option<FieldDescriptor> {
         self.inner()
             .field_numbers
-            .get(&number)
-            .map(|&index| FieldDescriptor {
+            .get(number)
+            .map(|index| FieldDescriptor {
                 message: self.clone(),
                 index,
             })

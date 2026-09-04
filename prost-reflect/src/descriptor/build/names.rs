@@ -1,4 +1,4 @@
-use std::collections::{hash_map, BTreeMap, HashMap, HashSet};
+use std::collections::{hash_map, HashMap, HashSet};
 
 use crate::{
     descriptor::{
@@ -127,7 +127,9 @@ impl Visitor for NameVisitor<'_> {
         self.pool.messages.push(MessageDescriptorInner {
             id: Identity::new(file, path, full_name, message.name()),
             fields: Vec::with_capacity(message.field.len()),
-            field_numbers: BTreeMap::new(),
+            field_numbers: crate::descriptor::FieldNumberIndex::with_capacity(
+                message.field.len(),
+            ),
             field_names: HashMap::with_capacity(message.field.len()),
             field_json_names: HashMap::with_capacity(message.field.len()),
             oneofs: Vec::with_capacity(message.oneof_decl.len()),

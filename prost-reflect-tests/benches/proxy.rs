@@ -181,6 +181,12 @@ fn lookup_by_name(c: &mut Criterion) {
         let desc = pool.get_message_by_name("test.ComplexType").unwrap();
         b.iter(|| desc.get_field_by_name(black_box("nested")).unwrap())
     });
+    c.bench_function("lookup_field_by_number", |b| {
+        // C2's direct signal: number lookup is binary search over the
+        // sorted-vec index (was a BTreeMap probe)
+        let desc = pool.get_message_by_name("test.ComplexType").unwrap();
+        b.iter(|| desc.get_field(black_box(1)).unwrap())
+    });
 }
 
 fn decode_encode_scalars(c: &mut Criterion) {

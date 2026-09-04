@@ -72,6 +72,13 @@ fn service_method_and_oneof_descriptor_contract() {
 
     let message = msg(&pool, "my.package.MyMessage");
     assert_eq!(message.name(), "MyMessage");
+    // file.index() matches its position in the pool's file order
+    let files: Vec<_> = pool.files().collect();
+    let pos = files
+        .iter()
+        .position(|f| f.name() == file.name())
+        .expect("file");
+    assert_eq!(file.index(), pos);
     assert_eq!(message.full_name(), "my.package.MyMessage");
     assert_eq!(message.path(), &[4, 0]);
     let oneofs: Vec<_> = message.oneofs().collect();
@@ -211,6 +218,18 @@ fn field_predicate_contract() {
         "repeated has no presence"
     );
 
+    // fields() iterates in ascending field-number order (the public
+    // ordering contract C1's merge-walk relies on) and agrees with
+    // get_field
+    let all_numbers: Vec<u32> = complex.fields().map(|f| f.number()).collect();
+    let mut sorted = all_numbers.clone();
+    sorted.sort_unstable();
+    assert_eq!(all_numbers, sorted, "fields() must be number-ascending");
+    assert!(!all_numbers.is_empty());
+    for number in &all_numbers {
+        assert_eq!(complex.get_field(*number).expect("field").number(), *number);
+    }
+
     // kind witnesses
     let enum_field = fld(&complex, "my_enum");
     match enum_field.kind() {
@@ -255,6 +274,15 @@ fn extension_descriptor_contract() {
     assert!(!file_ext.is_map());
     assert!(!file_ext.is_group());
     assert_eq!(file_ext.full_name(), "custom.options.file");
+    assert_eq!(file_ext.package_name(), "custom.options");
+    assert_eq!(
+        file_ext
+            .parent_pool()
+            .get_extension_by_name("custom.options.file")
+            .expect("same pool resolves it")
+            .full_name(),
+        "custom.options.file"
+    );
     assert_eq!(
         file_ext.containing_message().full_name(),
         "google.protobuf.FileOptions"
@@ -490,6 +518,36 @@ fn dynamic_message_field_surface() {
     });
     assert!(panicked.is_err(), "wrong-typed set must panic");
 
+    // invalid map-value type must panic too (pins the map-kind validity
+    // guards in is_valid_for_field)
+    let complex = msg(&test_file_descriptor(), "test.ComplexType");
+    let panicked = std::panic::catch_unwind(|| {
+        let mut m = DynamicMessage::new(complex);
+        m.set_field_by_name(
+            "string_map",
+            Value::Map(Default::default()), // map-typed value is fine
+        );
+    });
+    assert!(panicked.is_ok(), "map-typed value is valid");
+    let panicked = std::panic::catch_unwind(|| {
+        let mut m = DynamicMessage::new(msg(&test_file_descriptor(), "test.ComplexType"));
+        // wrong container: a list where the map belongs
+        m.set_field_by_name("string_map", Value::List(vec![]));
+    });
+    assert!(panicked.is_err(), "wrong container type must panic");
+
+    // invalid extension-value type must panic (is_valid_for_extension)
+    let p = test_file_descriptor();
+    let file_options = msg(&p, "google.protobuf.FileOptions");
+    let ext = p
+        .get_extension_by_name("custom.options.file")
+        .expect("custom.options.file");
+    let panicked = std::panic::catch_unwind(|| {
+        let mut m = DynamicMessage::new(file_options);
+        m.set_extension(&ext, Value::String("nope".into()));
+    });
+    assert!(panicked.is_err(), "wrong-typed extension set must panic");
+
     // presence-capable field: proto3 optional enum
     let opt = msg(&pool, "test.MessageWithOptionalEnum");
     let mut m2 = DynamicMessage::new(opt.clone());
@@ -681,6 +739,14 @@ fn mapkey_accessor_matrix() {
     assert_eq!(k.as_bool(), Some(false));
     assert!(k.as_string_mut().is_none());
 
+    let key = MapKey::U32(7);
+    assert_eq!(key.as_u32(), Some(7));
+    assert_eq!(key.as_i64(), None);
+    let mut k = key;
+    *k.as_u32_mut().expect("mut") = 8;
+    assert_eq!(k.as_u32(), Some(8));
+    assert!(k.as_i64_mut().is_none());
+
     let key = MapKey::U64(7);
     assert_eq!(key.as_u64(), Some(7));
     assert_eq!(key.as_i64(), None, "strict: U64 key is not I64");
@@ -695,6 +761,49 @@ fn mapkey_accessor_matrix() {
     let mut k = key;
     *k.as_i64_mut().expect("mut") = 8;
     assert_eq!(k.as_i64(), Some(8));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-field surface
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unknown_field_surface() {
+    let pool = pool();
+    let scalars = msg(&pool, "test.Scalars");
+    // payload: known field 3 (int32, varint 7) plus unknown fields
+    // 200 (varint 99), 201 (fixed64), 202 (length-delimited "abc")
+    let mut payload = Vec::new();
+    varint(3 << 3 | 0, &mut payload);
+    varint(7, &mut payload);
+    varint(200 << 3 | 0, &mut payload);
+    varint(99, &mut payload);
+    varint(201 << 3 | 1, &mut payload);
+    payload.extend_from_slice(&42u64.to_le_bytes());
+    varint(202 << 3 | 2, &mut payload);
+    varint(3, &mut payload);
+    payload.extend_from_slice(b"abc");
+
+    let mut message = DynamicMessage::decode(scalars, payload.as_slice()).expect("decode");
+    assert_eq!(
+        message.get_field_by_name("int32").as_deref(),
+        Some(&Value::I32(7))
+    );
+    let unknowns: Vec<_> = message.unknown_fields().collect();
+    assert_eq!(unknowns.len(), 3, "three unknown fields");
+    let numbers: Vec<u32> = unknowns.iter().map(|u| u.number()).collect();
+    assert_eq!(numbers, vec![200, 201, 202], "ascending number order");
+    // 200<<3 needs a 2-byte tag: varint = 2+1 bytes
+    assert_eq!(unknowns[0].encoded_len(), 3, "varint 99");
+    assert_eq!(unknowns[1].encoded_len(), 10, "fixed64: 2-byte tag + 8");
+    assert_eq!(unknowns[2].encoded_len(), 6, "len-delimited: 2+1+3");
+
+    // byte-identical roundtrip incl. unknown fields
+    assert_eq!(message.encode_to_vec(), payload, "unknowns preserved");
+
+    // take clears them
+    assert_eq!(message.take_unknown_fields().count(), 3);
+    assert_eq!(message.unknown_fields().count(), 0);
 }
 
 // ---------------------------------------------------------------------------
