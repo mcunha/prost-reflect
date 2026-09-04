@@ -1,9 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::btree_map::{self, BTreeMap},
-    fmt,
-    mem::replace,
-};
+use std::{borrow::Cow, fmt, mem::replace};
 
 use crate::{
     descriptor::RawFieldView, ExtensionDescriptor, FieldDescriptor, Kind, MessageDescriptor,
@@ -33,10 +28,16 @@ pub(crate) trait FieldDescriptorLike: fmt::Debug {
     }
 }
 
-/// A set of extension fields in a protobuf message.
+/// A set of fields (known, extension, and unknown) in a dynamic message.
+///
+/// C4: stored as a `Vec` kept sorted by field number (the same ascending
+/// order a `BTreeMap` yielded), so sparse set-field iteration stays in a
+/// valid protobuf wire order while lookups are binary searches and decode
+/// insertion appends with near-zero cost. `Taken` is only ever transient,
+/// mid-iteration (draining iterators replace entries in place).
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(super) struct DynamicMessageFieldSet {
-    fields: BTreeMap<u32, ValueOrUnknown>,
+    fields: Vec<(u32, ValueOrUnknown)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,10 +60,18 @@ pub(super) enum ValueAndDescriptor<'a> {
 }
 
 impl DynamicMessageFieldSet {
+    fn pos(&self, number: u32) -> Result<usize, usize> {
+        self.fields
+            .binary_search_by_key(&number, |&(field_number, _)| field_number)
+    }
+
     fn get_value(&self, number: u32) -> Option<&Value> {
-        match self.fields.get(&number) {
-            Some(ValueOrUnknown::Value(value)) => Some(value),
-            Some(ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken) | None => None,
+        match self.pos(number) {
+            Ok(index) => match &self.fields[index].1 {
+                ValueOrUnknown::Value(value) => Some(value),
+                ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => None,
+            },
+            Err(_) => None,
         }
     }
 
@@ -81,40 +90,50 @@ impl DynamicMessageFieldSet {
 
     pub(super) fn get_mut(&mut self, desc: &impl FieldDescriptorLike) -> &mut Value {
         self.clear_oneof_fields(desc);
-        match self.fields.entry(desc.number()) {
-            btree_map::Entry::Occupied(entry) => match entry.into_mut() {
-                ValueOrUnknown::Value(value) => value,
-                value => {
-                    *value = ValueOrUnknown::Value(desc.default_value());
-                    value.unwrap_value_mut()
-                }
-            },
-            btree_map::Entry::Vacant(entry) => entry
-                .insert(ValueOrUnknown::Value(desc.default_value()))
-                .unwrap_value_mut(),
-        }
+        let number = desc.number();
+        // Lazy default: the common case (slot already holds a Value) must
+        // not pay to build desc.default_value() - for message-kind fields
+        // that is a DynamicMessage::new (two Arc RMWs on the pool line).
+        self.entry_mut(number, || desc.default_value())
     }
 
     /// Decode: return the mutable slot for `number`, inserting `default`
     /// when the slot is absent or holds non-value state. Oneof sibling
     /// clearing is the caller's job via `clear_by_number`.
     pub(super) fn decode_entry(&mut self, number: u32, default: Value) -> &mut Value {
-        match self.fields.entry(number) {
-            btree_map::Entry::Occupied(entry) => match entry.into_mut() {
+        self.entry_mut(number, || default)
+    }
+
+    /// Mutable slot for `number`, inserting a default built by
+    /// `build_default` when the slot is absent or held by non-value state
+    /// (the closure runs only on those paths). Keeps the Vec sorted
+    /// (binary-search probe; inserts mid-vector on out-of-order numbers -
+    /// an O(n) shift per occurrence, while wire-ascending decode appends
+    /// amortized O(1); see the C4 risk note on descending-order input).
+    fn entry_mut(&mut self, number: u32, build_default: impl FnOnce() -> Value) -> &mut Value {
+        match self.pos(number) {
+            Ok(index) => match &mut self.fields[index].1 {
                 ValueOrUnknown::Value(value) => value,
                 slot => {
-                    *slot = ValueOrUnknown::Value(default);
+                    *slot = ValueOrUnknown::Value(build_default());
                     slot.unwrap_value_mut()
                 }
             },
-            btree_map::Entry::Vacant(entry) => entry
-                .insert(ValueOrUnknown::Value(default))
-                .unwrap_value_mut(),
+            Err(index) => {
+                self.fields
+                    .insert(index, (number, ValueOrUnknown::Value(build_default())));
+                match &mut self.fields[index].1 {
+                    ValueOrUnknown::Value(value) => value,
+                    ValueOrUnknown::Unknown(_) | ValueOrUnknown::Taken => unreachable!(),
+                }
+            }
         }
     }
 
     pub(super) fn clear_by_number(&mut self, number: u32) {
-        self.fields.remove(&number);
+        if let Ok(index) = self.pos(number) {
+            self.fields.remove(index);
+        }
     }
 
     pub(super) fn set(&mut self, desc: &impl FieldDescriptorLike, value: Value) {
@@ -124,8 +143,13 @@ impl DynamicMessageFieldSet {
         );
 
         self.clear_oneof_fields(desc);
-        self.fields
-            .insert(desc.number(), ValueOrUnknown::Value(value));
+        let number = desc.number();
+        match self.pos(number) {
+            Ok(index) => self.fields[index].1 = ValueOrUnknown::Value(value),
+            Err(index) => self
+                .fields
+                .insert(index, (number, ValueOrUnknown::Value(value))),
+        }
     }
 
     fn clear_oneof_fields(&mut self, desc: &impl FieldDescriptorLike) {
@@ -139,8 +163,8 @@ impl DynamicMessageFieldSet {
     }
 
     pub(crate) fn add_unknown(&mut self, number: u32, unknown: UnknownField) {
-        match self.fields.entry(number) {
-            btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+        match self.pos(number) {
+            Ok(index) => match &mut self.fields[index].1 {
                 ValueOrUnknown::Value(_) => {
                     panic!("expected no field to be found with number {number}")
                 }
@@ -149,46 +173,56 @@ impl DynamicMessageFieldSet {
                 }
                 ValueOrUnknown::Unknown(unknowns) => unknowns.insert(unknown),
             },
-            btree_map::Entry::Vacant(entry) => {
-                entry.insert(ValueOrUnknown::Unknown(UnknownFieldSet::from_iter([
-                    unknown,
-                ])));
+            Err(index) => {
+                self.fields.insert(
+                    index,
+                    (
+                        number,
+                        ValueOrUnknown::Unknown(UnknownFieldSet::from_iter([unknown])),
+                    ),
+                );
             }
         }
     }
 
     pub(super) fn clear(&mut self, desc: &impl FieldDescriptorLike) {
-        self.fields.remove(&desc.number());
+        self.clear_by_number(desc.number());
     }
 
     pub(crate) fn take(&mut self, desc: &impl FieldDescriptorLike) -> Option<Value> {
-        match self.fields.remove(&desc.number()) {
-            Some(ValueOrUnknown::Value(value)) if desc.has(&value) => Some(value),
-            _ => None,
+        let number = desc.number();
+        if let Ok(index) = self.pos(number) {
+            let (_, entry) = self.fields.remove(index);
+            if let ValueOrUnknown::Value(value) = entry {
+                if desc.has(&value) {
+                    return Some(value);
+                }
+            }
         }
+        None
     }
 
     /// Iterates only over the fields that are actually **set** on this message,
-    /// in ascending field-number order (the `BTreeMap` key order, which is a
+    /// in ascending field-number order (the `Vec` sort order, which is a
     /// valid protobuf wire order).
     ///
     /// Unlike [`iter`](Self::iter), which walks the entire message descriptor
     /// and probes `has`/`get` per field to honor `include_default` /
     /// `index_order` (needed by the serde/text serializers), this walks only
-    /// the sparse `fields` map. The encode path (`encode_raw` / `encoded_len`)
-    /// needs neither default fields nor source-definition order, so this is
-    /// O(set fields) instead of O(all descriptor fields) × 2 map lookups + a
-    /// `default_value()` allocation per absent field — a large win for messages
-    /// with many optional fields but few set.
+    /// the sparse `fields` vec. The encode path (`encode_raw` /
+    /// `encoded_len`) needs neither default fields nor source-definition
+    /// order, so this is O(set fields) instead of O(all descriptor fields) ×
+    /// 2 map lookups + a `default_value()` allocation per absent field — a
+    /// large win for messages with many optional fields but few set.
     pub(crate) fn iter_set<'a>(
         &'a self,
         message: &'a MessageDescriptor,
     ) -> impl Iterator<Item = ValueAndDescriptor<'a>> + 'a {
         self.fields
             .iter()
-            .filter_map(move |(&number, value)| match value {
+            .filter_map(move |(number, value)| match value {
                 ValueOrUnknown::Value(value) => {
-                    if let Some(view) = message.field_view(number) {
+                    if let Some(view) = message.field_view(*number) {
                         let present = view.supports_presence()
                             || !is_default_for_field_parts(
                                 value,
@@ -202,7 +236,7 @@ impl DynamicMessageFieldSet {
                         } else {
                             None
                         }
-                    } else if let Some(extension) = message.get_extension(number) {
+                    } else if let Some(extension) = message.get_extension(*number) {
                         if extension.has(value) {
                             Some(ValueAndDescriptor::Extension(
                                 Cow::Borrowed(value),
@@ -249,9 +283,9 @@ impl DynamicMessageFieldSet {
         let extensions_unknowns =
             self.fields
                 .iter()
-                .filter_map(move |(&number, value)| match value {
+                .filter_map(move |(number, value)| match value {
                     ValueOrUnknown::Value(value) => {
-                        if let Some(extension) = message.get_extension(number) {
+                        if let Some(extension) = message.get_extension(*number) {
                             if extension.has(value) {
                                 Some(ValueAndDescriptor::Extension(
                                     Cow::Borrowed(value),
@@ -275,12 +309,12 @@ impl DynamicMessageFieldSet {
         &'a self,
         message: &'a MessageDescriptor,
     ) -> impl Iterator<Item = (FieldDescriptor, &'a Value)> + 'a {
-        self.fields.iter().filter_map(move |(&number, value)| {
+        self.fields.iter().filter_map(move |(number, value)| {
             let value = match value {
                 ValueOrUnknown::Value(value) => value,
                 _ => return None,
             };
-            let field = match message.get_field(number) {
+            let field = match message.get_field(*number) {
                 Some(field) => field,
                 _ => return None,
             };
@@ -296,12 +330,12 @@ impl DynamicMessageFieldSet {
         &'a self,
         message: &'a MessageDescriptor,
     ) -> impl Iterator<Item = (ExtensionDescriptor, &'a Value)> + 'a {
-        self.fields.iter().filter_map(move |(&number, value)| {
+        self.fields.iter().filter_map(move |(number, value)| {
             let value = match value {
                 ValueOrUnknown::Value(value) => value,
                 _ => return None,
             };
-            let field = match message.get_extension(number) {
+            let field = match message.get_extension(*number) {
                 Some(field) => field,
                 _ => return None,
             };
@@ -314,7 +348,7 @@ impl DynamicMessageFieldSet {
     }
 
     pub(super) fn iter_unknown(&self) -> impl Iterator<Item = &'_ UnknownField> {
-        self.fields.values().flat_map(move |value| match value {
+        self.fields.iter().flat_map(move |(_, value)| match value {
             ValueOrUnknown::Taken | ValueOrUnknown::Value(_) => [].iter(),
             ValueOrUnknown::Unknown(unknowns) => unknowns.iter(),
         })
@@ -324,12 +358,12 @@ impl DynamicMessageFieldSet {
         &'a mut self,
         message: &'a MessageDescriptor,
     ) -> impl Iterator<Item = (FieldDescriptor, &'a mut Value)> + 'a {
-        self.fields.iter_mut().filter_map(move |(&number, value)| {
+        self.fields.iter_mut().filter_map(move |(number, value)| {
             let value = match value {
                 ValueOrUnknown::Value(value) => value,
                 _ => return None,
             };
-            let field = match message.get_field(number) {
+            let field = match message.get_field(*number) {
                 Some(field) => field,
                 _ => return None,
             };
@@ -345,12 +379,12 @@ impl DynamicMessageFieldSet {
         &'a mut self,
         message: &'a MessageDescriptor,
     ) -> impl Iterator<Item = (ExtensionDescriptor, &'a mut Value)> + 'a {
-        self.fields.iter_mut().filter_map(move |(&number, value)| {
+        self.fields.iter_mut().filter_map(move |(number, value)| {
             let value = match value {
                 ValueOrUnknown::Value(value) => value,
                 _ => return None,
             };
-            let field = match message.get_extension(number) {
+            let field = match message.get_extension(*number) {
                 Some(field) => field,
                 _ => return None,
             };
@@ -368,12 +402,12 @@ impl DynamicMessageFieldSet {
     ) -> impl Iterator<Item = (FieldDescriptor, Value)> + 'a {
         self.fields
             .iter_mut()
-            .filter_map(move |(&number, value_or_unknown)| {
+            .filter_map(move |(number, value_or_unknown)| {
                 let value = match value_or_unknown {
                     ValueOrUnknown::Value(value) => value,
                     _ => return None,
                 };
-                let field = match message.get_field(number) {
+                let field = match message.get_field(*number) {
                     Some(field) => field,
                     _ => return None,
                 };
@@ -394,12 +428,12 @@ impl DynamicMessageFieldSet {
     ) -> impl Iterator<Item = (ExtensionDescriptor, Value)> + 'a {
         self.fields
             .iter_mut()
-            .filter_map(move |(&number, value_or_unknown)| {
+            .filter_map(move |(number, value_or_unknown)| {
                 let value = match value_or_unknown {
                     ValueOrUnknown::Value(value) => value,
                     _ => return None,
                 };
-                let field = match message.get_extension(number) {
+                let field = match message.get_extension(*number) {
                     Some(field) => field,
                     _ => return None,
                 };
@@ -416,8 +450,8 @@ impl DynamicMessageFieldSet {
 
     pub(crate) fn take_unknown(&mut self) -> impl Iterator<Item = UnknownField> + '_ {
         self.fields
-            .values_mut()
-            .flat_map(move |value_or_unknown| match value_or_unknown {
+            .iter_mut()
+            .flat_map(move |(_, value_or_unknown)| match value_or_unknown {
                 ValueOrUnknown::Unknown(_) => replace(value_or_unknown, ValueOrUnknown::Taken)
                     .unwrap_unknown()
                     .into_iter(),
@@ -429,7 +463,6 @@ impl DynamicMessageFieldSet {
         self.fields.clear();
     }
 }
-
 impl ValueOrUnknown {
     fn unwrap_value_mut(&mut self) -> &mut Value {
         match self {
